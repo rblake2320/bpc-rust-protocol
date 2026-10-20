@@ -1,0 +1,32 @@
+{
+  "generated_by": "Node.js WebCrypto ECDSA P-256 + HKDF-SHA256",
+  "registration_secret": "InteropSecret9!@",
+  "request_hmac_key": "d-Sr95-3Lrwgf-NC5CTiQp4erE07ResOyeO9gudxt6E",
+  "public_jwk": {
+    "kty": "EC",
+    "crv": "P-256",
+    "x": "WovlWJL6NSEleg0iCNjNPM_sp_IqyG_xhvxP3Jlgh2Q",
+    "y": "6jyqPvtTZzdk5N8QH-RY9e1sBKAKqYoSIQ7t0q1p-0Y",
+    "key_ops": [
+      "verify"
+    ],
+    "ext": true
+  },
+  "body_base64url": "eyJ3aWRnZXQiOiJicGMiLCJjb3VudCI6Mn0",
+  "payload": {
+    "body_hash": "sha256:oylRM3B035IWXcW-sL7flyhrHVBqdv7Y23wulC03kes",
+    "method": "POST",
+    "nonce": "123e4567-e89b-42d3-a456-426614174000",
+    "pair_id": "pair_nodeinterop",
+    "path": "/v1/widgets?source=node",
+    "secret_hmac": "NARKEtFBZ68fSyvQTJeD6-sjdKJG4j3Tywmf37fUasg",
+    "timestamp": 1740000000000,
+    "version": "1.0"
+  },
+  "headers": {
+    "pair_id": "pair_nodeinterop",
+    "signature": "sdQAAdIZE2OqMa2Zj_EwhCbJIpfwsUW7V9L75dnKUFUI_z6PgQ-qcNRdHql-ozMVR24TDKXFgmScXnrP4vZLag",
+    "signed_data": "eyJib2R5X2hhc2giOiJzaGEyNTY6b3lsUk0zQjAzNUlXWGNXLXNMN2ZseWhySFZCcWR2N1kyM3d1bEMwM2tlcyIsIm1ldGhvZCI6IlBPU1QiLCJub25jZSI6IjEyM2U0NTY3LWU4OWItNDJkMy1hNDU2LTQyNjYxNDE3NDAwMCIsInBhaXJfaWQiOiJwYWlyX25vZGVpbnRlcm9wIiwicGF0aCI6Ii92MS93aWRnZXRzP3NvdXJjZT1ub2RlIiwic2VjcmV0X2htYWMiOiJOQVJLRXRGQlo2OGZTeXZRVEplRDYtc2pkS0pHNGozVHl3bWYzN2ZVYXNnIiwidGltZXN0YW1wIjoxNzQwMDAwMDAwMDAwLCJ2ZXJzaW9uIjoiMS4wIn0",
+    "version": "1.0"
+  }
+}
