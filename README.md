@@ -153,6 +153,10 @@ A `PairKind::Ghost` requires a `CanaryClass`. It fully verifies cryptography and
 
 A database-only chain cannot prevent a privileged rollback/fork/tail truncation. Periodically sign/export `{sequence, chain_hash, count}` to an independent KMS/WORM/monitoring system and verify against that external anchor. Keep audit data sanitized and bounded; never place registration secrets, raw signatures, signed payloads, or raw JWKs in `detail`.
 
+## Continuous integration
+
+The repository includes the full Redis/PostgreSQL service-tested GitHub Actions definition at [`ci/github-actions-ci.yml`](ci/github-actions-ci.yml). Promote that file to `.github/workflows/ci.yml` to activate it in GitHub Actions. The initial publication credential used for this repository lacks GitHub’s `workflows` permission, so it cannot create workflow files remotely; the template is otherwise ready to run unchanged.
+
 ## Interoperability and validation
 
 The test suite covers:
