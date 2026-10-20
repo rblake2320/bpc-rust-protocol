@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::{fmt::Write as _, sync::Mutex};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -227,10 +227,12 @@ pub fn audit_hash(entry: &AuditEntry) -> Result<String> {
         entry.event.request_id.as_deref(),
         entry.event.detail.as_deref(),
     ))?;
-    Ok(Sha256::digest(preimage)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    let digest = Sha256::digest(preimage);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(encoded)
 }
 
 /// Verifies chain order, the genesis invariant, every hash/link, and an optional external anchor.

@@ -5,7 +5,7 @@
 //! are atomic and version-fenced. Run migrations using a dedicated migration
 //! role; the runtime role should retain only the DML permissions it needs.
 
-use std::sync::Mutex;
+use std::{fmt::Write as _, sync::Mutex};
 
 use postgres::{Client, NoTls, Row, Transaction};
 use serde_json::Value;
@@ -617,10 +617,12 @@ fn same_authorization_policy(left: &PairRecord, right: &PairRecord) -> bool {
 }
 
 fn hash_token(token: &str) -> String {
-    Sha256::digest(token.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let digest = Sha256::digest(token.as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 fn to_i64(value: u64) -> Result<i64> {
     i64::try_from(value)
