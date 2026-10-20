@@ -81,29 +81,33 @@ The in-memory stores are deliberately limited to one process. Do **not** use the
 
 ### 1. PostgreSQL authority
 
-Provision schema with a dedicated migration role, then give the runtime role only the narrow DML privileges it needs. `PostgresPairAuthority` uses `SERIALIZABLE` transactions, a transaction advisory lock for capacity decisions, row locks/version fencing, one-way lifecycle transitions, and SHA-256-hashed approval tokens.
+Provision schema with a dedicated migration role, then give the runtime role only the narrow DML privileges it needs. `PostgresPairAuthority` uses `SERIALIZABLE` transactions, a transaction advisory lock for capacity decisions, row locks/version fencing, one-way lifecycle transitions, and SHA-256-hashed approval tokens. It encrypts the BPC HMAC verifier and pending enrollment material with AES-256-GCM before they enter PostgreSQL.
 
 ```rust
-use bpc_protocol::{PostgresAuthorityConfig, PostgresPairAuthority};
+use bpc_protocol::{PostgresAuthorityConfig, PostgresPairAuthority, PostgresSecretProtector};
 
-let authority = PostgresPairAuthority::connect(
+let data_key = PostgresSecretProtector::from_base64url(
+    "kms-key-generation-2026-10",
+    &std::env::var("BPC_POSTGRES_DATA_KEY_B64URL")?,
+)?;
+let authority = PostgresPairAuthority::connect_tls(
     &std::env::var("BPC_DATABASE_URL")?,
-    PostgresAuthorityConfig::default(),
+    PostgresAuthorityConfig::new(data_key),
 )?;
 authority.migrate()?; // Run during controlled provisioning, not every app start.
 ```
 
-Use TLS in the PostgreSQL URL in production. The database necessarily contains verifier HMAC material; encrypt volumes/backups, apply least privilege, and use a managed/KMS-backed database encryption posture for your environment.
+`connect_tls` requires `sslmode=verify-full` in the PostgreSQL URL and validates the hostname/certificate chain against the system trust store. `connect` is limited to literal loopback endpoints for isolated tests. Keep the envelope key in a KMS/secret manager, rotate it with an explicit re-encryption migration, and separately encrypt volumes/backups with least-privilege database roles.
 
 ### 2. Governed Redis replay defense
 
-The Redis store will only operate when `maxmemory-policy=noeviction`; an eviction-capable Redis instance is unsafe for replay prevention. Configure ACL/TLS/authentication, dedicate the database/cluster tenancy, and grant the `CONFIG GET maxmemory-policy` permission needed for the safety check.
+The Redis store will only operate when `maxmemory-policy=noeviction`; an eviction-capable Redis instance is unsafe for replay prevention. It requires verified `rediss://` in production; `redis://` is available only after an explicit `allow_insecure_loopback` opt-in for a literal loopback development endpoint. Configure ACL/authentication, dedicate the database/cluster tenancy, and grant the `CONFIG GET maxmemory-policy` permission needed for the safety check.
 
 ```rust
 use bpc_protocol::{GovernedRedisNonceConfig, GovernedRedisNonceStore};
 
 let cfg = GovernedRedisNonceConfig::new("payments-prod", "deploy-epoch-2026-10", 60_000)?;
-let nonce_store = GovernedRedisNonceStore::connect(&std::env::var("BPC_REDIS_URL")?, cfg)?;
+let nonce_store = GovernedRedisNonceStore::connect(&std::env::var("BPC_REDIS_URL")?, cfg)?; // rediss://...
 
 // On a new namespace or epoch mismatch this deliberately returns a quarantine error.
 // After the configured horizon, run this from a serialized readiness/reconciliation task.
@@ -122,14 +126,17 @@ use std::sync::Arc;
 use axum::{middleware, Router};
 use bpc_protocol::{bpc_axum_middleware, BpcAxumState, BpcVerifier};
 
-# let authority = Arc::new(bpc_protocol::PostgresPairAuthority::connect("postgres://...", bpc_protocol::PostgresAuthorityConfig::default())?);
-# let nonce_store = Arc::new(bpc_protocol::GovernedRedisNonceStore::connect("redis://...", bpc_protocol::GovernedRedisNonceConfig::new("example", "epoch-1", 60_000)?)?);
+# let protector = bpc_protocol::PostgresSecretProtector::new("tests", [1; 32])?;
+# let authority = Arc::new(bpc_protocol::PostgresPairAuthority::connect("postgres://postgres:postgres@127.0.0.1/postgres", bpc_protocol::PostgresAuthorityConfig::new(protector))?);
+# let mut redis_config = bpc_protocol::GovernedRedisNonceConfig::new("example", "epoch-1", 60_000)?;
+# redis_config.allow_insecure_loopback = true;
+# let nonce_store = Arc::new(bpc_protocol::GovernedRedisNonceStore::connect("redis://127.0.0.1:6379/", redis_config)?);
 let state = BpcAxumState::new(BpcVerifier::default(), authority, nonce_store);
 let app = Router::new().layer(middleware::from_fn_with_state(state, bpc_axum_middleware));
 # Ok::<(), bpc_protocol::BpcError>(())
 ```
 
-`AuthSnapshot` is inserted into request extensions only after successful final authorization. Limit buffered body size with `state.max_body_bytes`; ordinary BPC v1 requests must have a precomputed exact-body digest, so streaming uploads need an explicit protocol design.
+`AuthSnapshot` is inserted into request extensions only after successful final authorization. The adapter defaults to generic public authentication failures, rejects oversized declared bodies before buffering, and bounds concurrent body collection. Set `state.max_body_bytes` and `state.with_body_collection_limit(...)` for expected request volume; retain server/proxy header, body-read, connection, and trusted-source rate limits. Ordinary BPC v1 requests must have a precomputed exact-body digest, so streaming uploads need an explicit protocol design.
 
 ## Pair lifecycle and rotation
 
@@ -155,7 +162,9 @@ A database-only chain cannot prevent a privileged rollback/fork/tail truncation.
 
 ## Continuous integration
 
-The repository includes the full Redis/PostgreSQL service-tested GitHub Actions definition at [`ci/github-actions-ci.yml`](ci/github-actions-ci.yml). Promote that file to `.github/workflows/ci.yml` to activate it in GitHub Actions. The initial publication credential used for this repository lacks GitHub’s `workflows` permission, so it cannot create workflow files remotely; the template is otherwise ready to run unchanged.
+The repository includes the full Redis/PostgreSQL service-tested GitHub Actions definition at [`ci/github-actions-ci.yml`](ci/github-actions-ci.yml). It pins actions to commit SHAs, service images to immutable digests, uses read-only permissions, disables persisted checkout credentials, locks the Rust dependency graph, and runs `cargo-audit`. Promote that file to `.github/workflows/ci.yml` to activate it in GitHub Actions. The initial publication credential used for this repository lacks GitHub’s `workflows` permission, so it cannot create workflow files remotely; activate the reviewed template through a credential with that narrowly scoped permission, then require it in branch protection.
+
+Before calling an application or a BPC–TSK composition production-vetted, satisfy the evidence requirements in [`docs/PRODUCTION_RELEASE_GATES.md`](docs/PRODUCTION_RELEASE_GATES.md). They deliberately include controls that cannot be delivered by a protocol crate alone.
 
 ## Interoperability and validation
 

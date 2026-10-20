@@ -7,8 +7,9 @@ use std::time::Duration;
 use bpc_protocol::{
     AuditAction, AuditEvent, AuditLog, AuditSeverity, BpcKeyPair, GovernedRedisNonceConfig,
     GovernedRedisNonceStore, NonceStore, PairAuthority, PairKind, PairMode, PairRegistration,
-    PairRegistry, PostgresAuditLog, PostgresAuthorityConfig, PostgresPairAuthority, Scope,
-    SuccessClaim, derive_request_hmac_key, sign_rotation_at, verify_and_rotate_at,
+    PairRegistry, PostgresAuditLog, PostgresAuthorityConfig, PostgresPairAuthority,
+    PostgresSecretProtector, Scope, SuccessClaim, derive_request_hmac_key, sign_rotation_at,
+    verify_and_rotate_at,
 };
 use postgres::{Client, NoTls};
 use uuid::Uuid;
@@ -26,6 +27,7 @@ fn governed_redis_fails_closed_then_detects_real_replay() {
     let url = required_env("BPC_TEST_REDIS_URL");
     let namespace = format!("bpcitest{}", Uuid::new_v4().simple());
     let mut config = GovernedRedisNonceConfig::new(namespace, "epoch-v1", 25).unwrap();
+    config.allow_insecure_loopback = true;
     config.safety_buffer_ms = 5;
     config.continuity_allowance_ms = 5;
     config.command_timeout = Duration::from_secs(2);
@@ -63,8 +65,10 @@ fn postgres_authority_and_audit_are_real_transactional_backends() {
             &url,
             PostgresAuthorityConfig {
                 max_active_pairs: 10,
+                max_pending_pairs: 1,
                 approval_ttl_ms: 60_000,
                 schema: schema.clone(),
+                secret_protector: PostgresSecretProtector::new("test-key-v1", [7; 32])?,
             },
         )?;
         authority.migrate()?;
@@ -81,9 +85,19 @@ fn postgres_authority_and_audit_are_real_transactional_backends() {
             canary_class: None,
         };
         let now = bpc_protocol::unix_ms()?;
-        let token = authority.request_pairing(registration, now)?;
+        let token = authority.request_pairing(registration.clone(), now)?;
+        assert!(authority.request_pairing(registration, now).is_err());
         let pair_id = authority.approve_pairing(&token, now)?;
         let initial = authority.get(&pair_id)?.expect("approved pair exists");
+        let stored_ciphertext: String = admin
+            .query_one(
+                &format!("SELECT request_hmac_ciphertext FROM {schema}.bpc_pairs WHERE id = $1"),
+                &[&pair_id],
+            )
+            .unwrap()
+            .get(0);
+        assert!(stored_ciphertext.starts_with("v1.test-key-v1."));
+        assert!(!stored_ciphertext.contains(&initial.request_hmac_key));
         assert_eq!(
             authority.claim_success(&initial, now)?,
             SuccessClaim::Claimed

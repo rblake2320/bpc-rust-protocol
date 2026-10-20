@@ -14,7 +14,9 @@ const MAX_SIGNED_DATA_LEN: usize = 4096;
 pub struct BpcVerifierConfig {
     /// Permitted difference between verifier and client clocks, in milliseconds.
     pub signature_window_ms: u64,
-    /// Number of failed authenticated verification attempts before a pair locks.
+    /// Number of invalid P-256 signatures with a valid secret-HMAC factor before
+    /// a pair locks. Zero disables credential lockout; edge rate limiting still
+    /// applies to every denial.
     pub lockout_after: u32,
 }
 
@@ -140,7 +142,7 @@ impl BpcVerifier {
                 );
             }
         }
-        if pair.failed_signatures >= self.config.lockout_after {
+        if self.config.lockout_after > 0 && pair.failed_signatures >= self.config.lockout_after {
             return VerificationResult::denied(
                 Some(request.pair_id),
                 VerificationError::PairLocked,
@@ -165,13 +167,11 @@ impl BpcVerifier {
             );
         }
 
-        // Invalid data for a known active pair counts toward the lockout threshold.
         let (payload, canonical) = match parse_canonical_payload(request.signed_data) {
             Ok(parsed) => parsed,
             Err(_) => {
-                return self.reject_failure(
-                    registry,
-                    request.pair_id,
+                return VerificationResult::denied(
+                    Some(request.pair_id),
                     VerificationError::InvalidSignedData,
                 );
             }
@@ -181,9 +181,8 @@ impl BpcVerifier {
                 if nonce.get_version() == Some(Version::Random)
                     && nonce.get_variant() == Variant::RFC4122 => {}
             _ => {
-                return self.reject_failure(
-                    registry,
-                    request.pair_id,
+                return VerificationResult::denied(
+                    Some(request.pair_id),
                     VerificationError::InvalidSignedData,
                 );
             }
@@ -194,58 +193,51 @@ impl BpcVerifier {
             payload.timestamp,
             &payload.secret_hmac,
         ) {
-            return self.reject_failure(
-                registry,
-                request.pair_id,
+            return VerificationResult::denied(
+                Some(request.pair_id),
                 VerificationError::InvalidSecretHmac,
             );
         }
         if now_ms.abs_diff(payload.timestamp) > self.config.signature_window_ms {
-            return self.reject_failure(
-                registry,
-                request.pair_id,
+            return VerificationResult::denied(
+                Some(request.pair_id),
                 VerificationError::TimestampExpired,
             );
         }
         if payload.method != request.method || payload.path != request.path {
-            return self.reject_failure(
-                registry,
-                request.pair_id,
+            return VerificationResult::denied(
+                Some(request.pair_id),
                 VerificationError::MethodPathMismatch,
             );
         }
         if payload.pair_id != request.pair_id {
-            return self.reject_failure(
-                registry,
-                request.pair_id,
+            return VerificationResult::denied(
+                Some(request.pair_id),
                 VerificationError::PairIdMismatch,
             );
         }
         if !pair.scope.allows(request.method) || !pair.scope.allows(&payload.method) {
-            return self.reject_failure(
-                registry,
-                request.pair_id,
+            return VerificationResult::denied(
+                Some(request.pair_id),
                 VerificationError::ScopeViolation,
             );
         }
         if payload.body_hash.is_empty() {
-            return self.reject_failure(
-                registry,
-                request.pair_id,
+            return VerificationResult::denied(
+                Some(request.pair_id),
                 VerificationError::MissingBodyHash,
             );
         }
         if payload.body_hash != body_hash(request.body) {
-            return self.reject_failure(
-                registry,
-                request.pair_id,
+            return VerificationResult::denied(
+                Some(request.pair_id),
                 VerificationError::InvalidBodyHash,
             );
         }
         let verifying_key = match pair.public_jwk.to_verifying_key() {
             Ok(key) => key,
             Err(_) => {
-                return self.reject_failure(
+                return self.reject_authenticated_signature_failure(
                     registry,
                     request.pair_id,
                     VerificationError::InvalidSignature,
@@ -253,7 +245,7 @@ impl BpcVerifier {
             }
         };
         if !verify_payload_bytes(&verifying_key, &canonical, request.signature) {
-            return self.reject_failure(
+            return self.reject_authenticated_signature_failure(
                 registry,
                 request.pair_id,
                 VerificationError::InvalidSignature,
@@ -316,7 +308,11 @@ impl BpcVerifier {
         }
     }
 
-    fn reject_failure<R: PairRegistry>(
+    /// Only a request that has already proven the independent secret-HMAC
+    /// factor may affect credential-wide signature lockout state. All earlier
+    /// malformed or unauthenticated traffic must be handled by edge/source rate
+    /// limits, never by a pair-ID-controlled persistent lockout.
+    fn reject_authenticated_signature_failure<R: PairRegistry>(
         &self,
         registry: &R,
         pair_id: &str,

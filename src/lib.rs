@@ -91,7 +91,7 @@ pub use types::{
 pub use verifier::{BpcVerifier, BpcVerifierConfig};
 
 #[cfg(feature = "axum")]
-pub use axum::{BpcAxumState, auth_snapshot, bpc_axum_middleware};
+pub use axum::{BpcAxumState, BpcPublicErrorDisclosure, auth_snapshot, bpc_axum_middleware};
 
 #[cfg(feature = "redis-store")]
 pub use redis_store::{GovernedRedisNonceConfig, GovernedRedisNonceStore};
@@ -99,6 +99,7 @@ pub use redis_store::{GovernedRedisNonceConfig, GovernedRedisNonceStore};
 #[cfg(feature = "postgres-store")]
 pub use postgres_store::{
     POSTGRES_SCHEMA, PostgresAuditLog, PostgresAuthorityConfig, PostgresPairAuthority,
+    PostgresSecretProtector,
 };
 
 #[cfg(feature = "reqwest-client")]

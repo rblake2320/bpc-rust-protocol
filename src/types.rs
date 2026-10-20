@@ -546,6 +546,9 @@ impl PairRegistry for MemoryPairRegistry {
     }
 
     fn record_failure(&self, pair_id: &str, lockout_after: u32) -> Result<()> {
+        if lockout_after == 0 {
+            return Ok(());
+        }
         let mut pairs = self
             .pairs
             .lock()

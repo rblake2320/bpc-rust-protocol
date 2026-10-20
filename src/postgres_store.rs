@@ -7,16 +7,151 @@
 
 use std::sync::Mutex;
 
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use postgres::{Client, NoTls, Row, Transaction};
+use postgres_rustls::{MakeTlsConnector, set_postgresql_alpn};
+use rand_core::{OsRng, RngCore};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::{
     AuditAction, AuditEntry, AuditEvent, AuditHead, AuditLog, AuditSeverity, AuditVerification,
     BpcError, CanaryClass, PairAuthority, PairKind, PairMode, PairRecord, PairRegistration,
-    PairRegistry, PairStatus, PublicJwk, RedactedPair, Result, Scope, SuccessClaim,
+    PairRegistry, PairStatus, PublicJwk, RedactedPair, Result, Scope, SuccessClaim, b64url_decode,
+    b64url_encode,
 };
+
+/// Encrypts BPC verifier material before it enters a durable PostgreSQL row.
+///
+/// Construct this value from a data-encryption key obtained from a secret
+/// manager or KMS-backed envelope service, not from application source or a
+/// database connection string. The `key_id` is deliberately carried in each
+/// ciphertext envelope so a controlled re-encryption migration can distinguish
+/// key generations without storing key material in PostgreSQL.
+pub struct PostgresSecretProtector {
+    key_id: String,
+    data_key: [u8; 32],
+}
+
+impl PostgresSecretProtector {
+    /// Creates a protector from exactly 32 bytes of AES-256 key material.
+    pub fn new(key_id: impl Into<String>, data_key: [u8; 32]) -> Result<Self> {
+        let key_id = key_id.into();
+        if !is_key_id(&key_id) {
+            return Err(BpcError::PairRegistry(
+                "PostgreSQL secret-protector key id is invalid".into(),
+            ));
+        }
+        Ok(Self { key_id, data_key })
+    }
+
+    /// Decodes an unpadded base64url AES-256 key supplied by a deployment
+    /// secret manager. The plaintext key must never be committed or logged.
+    pub fn from_base64url(key_id: impl Into<String>, encoded_data_key: &str) -> Result<Self> {
+        let bytes = b64url_decode(encoded_data_key)?;
+        let data_key: [u8; 32] = bytes.try_into().map_err(|_| {
+            BpcError::PairRegistry("PostgreSQL data-encryption key must be 32 bytes".into())
+        })?;
+        Self::new(key_id, data_key)
+    }
+
+    /// Returns the non-secret key-generation label included in ciphertexts.
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    fn seal(&self, context: &str, plaintext: &[u8]) -> Result<String> {
+        let cipher = Aes256Gcm::new_from_slice(&self.data_key).map_err(|_| {
+            BpcError::PairRegistry("could not initialize PostgreSQL secret protector".into())
+        })?;
+        let mut nonce = [0_u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+        let ciphertext = cipher
+            .encrypt(
+                &Nonce::from(nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: context.as_bytes(),
+                },
+            )
+            .map_err(|_| {
+                BpcError::PairRegistry("could not encrypt PostgreSQL verifier secret".into())
+            })?;
+        let mut envelope = Vec::with_capacity(nonce.len() + ciphertext.len());
+        envelope.extend_from_slice(&nonce);
+        envelope.extend_from_slice(&ciphertext);
+        Ok(format!("v1.{}.{}", self.key_id, b64url_encode(envelope)))
+    }
+
+    fn open(&self, context: &str, envelope: &str) -> Result<Vec<u8>> {
+        let mut pieces = envelope.split('.');
+        let (Some(version), Some(key_id), Some(encoded), None) =
+            (pieces.next(), pieces.next(), pieces.next(), pieces.next())
+        else {
+            return Err(BpcError::PairRegistry(
+                "stored PostgreSQL secret envelope is malformed".into(),
+            ));
+        };
+        if version != "v1" || key_id != self.key_id {
+            return Err(BpcError::PairRegistry(
+                "stored PostgreSQL secret envelope uses an unavailable key".into(),
+            ));
+        }
+        let bytes = b64url_decode(encoded)?;
+        if bytes.len() < 12 + 16 {
+            return Err(BpcError::PairRegistry(
+                "stored PostgreSQL secret envelope is too short".into(),
+            ));
+        }
+        let cipher = Aes256Gcm::new_from_slice(&self.data_key).map_err(|_| {
+            BpcError::PairRegistry("could not initialize PostgreSQL secret protector".into())
+        })?;
+        let nonce: [u8; 12] = bytes[..12].try_into().map_err(|_| {
+            BpcError::PairRegistry("stored PostgreSQL secret envelope nonce is invalid".into())
+        })?;
+        cipher
+            .decrypt(
+                &Nonce::from(nonce),
+                Payload {
+                    msg: &bytes[12..],
+                    aad: context.as_bytes(),
+                },
+            )
+            .map_err(|_| {
+                BpcError::PairRegistry("stored PostgreSQL verifier secret cannot be opened".into())
+            })
+    }
+}
+
+impl Clone for PostgresSecretProtector {
+    fn clone(&self) -> Self {
+        Self {
+            key_id: self.key_id.clone(),
+            data_key: self.data_key,
+        }
+    }
+}
+
+impl std::fmt::Debug for PostgresSecretProtector {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PostgresSecretProtector")
+            .field("key_id", &self.key_id)
+            .field("data_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for PostgresSecretProtector {
+    fn drop(&mut self) {
+        self.data_key.zeroize();
+    }
+}
 
 /// Fresh-install schema for the Rust production authority. It uses strict
 /// constraints at the database boundary; Rust additionally validates P-256
@@ -27,7 +162,7 @@ CREATE TABLE IF NOT EXISTS bpc_pairs (
     name                  VARCHAR(128) NOT NULL CHECK (length(name) > 0),
     scope                 TEXT NOT NULL CHECK (scope IN ('read','read-write','admin')),
     mode                  TEXT NOT NULL CHECK (mode IN ('development','production')),
-    request_hmac_key      CHAR(43) NOT NULL CHECK (request_hmac_key ~ '^[A-Za-z0-9_-]{43}$'),
+    request_hmac_ciphertext TEXT NOT NULL CHECK (length(request_hmac_ciphertext) <= 512),
     public_jwk            JSONB NOT NULL CHECK (
         public_jwk->>'kty' = 'EC' AND public_jwk->>'crv' = 'P-256'
         AND public_jwk ? 'x' AND public_jwk ? 'y'
@@ -48,7 +183,7 @@ CREATE INDEX IF NOT EXISTS bpc_pairs_active_idx ON bpc_pairs (status) WHERE stat
 
 CREATE TABLE IF NOT EXISTS bpc_pending (
     token_hash       CHAR(64) PRIMARY KEY CHECK (token_hash ~ '^[0-9a-f]{64}$'),
-    registration     JSONB NOT NULL,
+    registration_ciphertext TEXT NOT NULL CHECK (length(registration_ciphertext) <= 4096),
     requested_at_ms  BIGINT NOT NULL CHECK (requested_at_ms >= 0 AND requested_at_ms <= 9007199254740991),
     expires_at_ms    BIGINT NOT NULL CHECK (expires_at_ms >= requested_at_ms AND expires_at_ms <= 9007199254740991)
 );
@@ -88,24 +223,37 @@ CREATE INDEX IF NOT EXISTS bpc_audit_time_idx ON bpc_audit (timestamp_ms DESC);
 #[derive(Clone, Debug)]
 pub struct PostgresAuthorityConfig {
     pub max_active_pairs: u64,
+    /// Global bound for pending enrollment material. Expired rows are purged
+    /// transactionally before every insert.
+    pub max_pending_pairs: u64,
     /// Pending approvals expire rather than leaving unbounded authorization material.
     pub approval_ttl_ms: u64,
     pub schema: String,
-}
-
-impl Default for PostgresAuthorityConfig {
-    fn default() -> Self {
-        Self {
-            max_active_pairs: 2_000,
-            approval_ttl_ms: 15 * 60 * 1_000,
-            schema: "public".into(),
-        }
-    }
+    /// Mandatory envelope protector for HMAC verifier material and pending
+    /// registrations. Supply a unique deployment key from a KMS/secret manager.
+    pub secret_protector: PostgresSecretProtector,
 }
 
 impl PostgresAuthorityConfig {
+    /// Builds a production configuration with explicit verifier-secret
+    /// protection. There is intentionally no `Default`: silently choosing a
+    /// process-local or hard-coded encryption key would make durable records
+    /// unreadable or falsely appear protected.
+    pub fn new(secret_protector: PostgresSecretProtector) -> Self {
+        Self {
+            max_active_pairs: 2_000,
+            max_pending_pairs: 2_000,
+            approval_ttl_ms: 15 * 60 * 1_000,
+            schema: "public".into(),
+            secret_protector,
+        }
+    }
+
     fn validate(&self) -> Result<()> {
-        if self.max_active_pairs == 0 || self.approval_ttl_ms == 0 || !is_schema_name(&self.schema)
+        if self.max_active_pairs == 0
+            || self.max_pending_pairs == 0
+            || self.approval_ttl_ms == 0
+            || !is_schema_name(&self.schema)
         {
             return Err(BpcError::PairRegistry(
                 "invalid PostgreSQL authority configuration".into(),
@@ -123,9 +271,26 @@ pub struct PostgresPairAuthority {
 }
 
 impl PostgresPairAuthority {
+    /// Connects only to an explicitly loopback PostgreSQL endpoint without TLS.
+    /// Production callers must use [`Self::connect_tls`].
     pub fn connect(url: &str, config: PostgresAuthorityConfig) -> Result<Self> {
         config.validate()?;
+        require_loopback_database(url)?;
         let mut client = Client::connect(url, NoTls).map_err(pg_error)?;
+        set_schema(&mut client, &config.schema)?;
+        Ok(Self {
+            client: Mutex::new(client),
+            config,
+        })
+    }
+
+    /// Connects using TLS 1.2+ and the system trust store. The URL must use
+    /// `sslmode=verify-full` so certificate chain and server hostname validation
+    /// are both mandatory.
+    pub fn connect_tls(url: &str, config: PostgresAuthorityConfig) -> Result<Self> {
+        config.validate()?;
+        require_verified_postgres_tls(url)?;
+        let mut client = connect_postgres_tls(url)?;
         set_schema(&mut client, &config.schema)?;
         Ok(Self {
             client: Mutex::new(client),
@@ -137,6 +302,8 @@ impl PostgresPairAuthority {
     /// restrict this method from the runtime application's database credential.
     pub fn migrate(&self) -> Result<()> {
         let mut client = self.lock_client()?;
+        ensure_schema(&mut client, &self.config.schema)?;
+        set_schema(&mut client, &self.config.schema)?;
         client.batch_execute(POSTGRES_SCHEMA).map_err(pg_error)
     }
 
@@ -160,10 +327,14 @@ impl PairRegistry for PostgresPairAuthority {
         let row = client
             .query_opt("SELECT * FROM bpc_pairs WHERE id = $1", &[&pair_id])
             .map_err(pg_error)?;
-        row.map(row_to_pair).transpose()
+        row.map(|row| row_to_pair(row, &self.config.secret_protector))
+            .transpose()
     }
 
     fn record_failure(&self, pair_id: &str, lockout_after: u32) -> Result<()> {
+        if lockout_after == 0 {
+            return Ok(());
+        }
         let mut client = self.lock_client()?;
         let threshold = i32::try_from(lockout_after).map_err(|_| {
             BpcError::PairRegistry("lockout threshold exceeds PostgreSQL range".into())
@@ -194,7 +365,7 @@ impl PairRegistry for PostgresPairAuthority {
             tx.commit().map_err(pg_error)?;
             return Ok(SuccessClaim::StateChanged);
         };
-        let current = row_to_pair(row)?;
+        let current = row_to_pair(row, &self.config.secret_protector)?;
         if !same_authorization_policy(&current, expected) {
             tx.commit().map_err(pg_error)?;
             return Ok(SuccessClaim::StateChanged);
@@ -262,12 +433,38 @@ impl PairAuthority for PostgresPairAuthority {
             .checked_add(self.config.approval_ttl_ms)
             .ok_or_else(|| BpcError::PairRegistry("approval expiration overflow".into()))?;
         let token = format!("approval_{}", Uuid::new_v4().simple());
-        let registration_json = serde_json::to_value(&registration)?;
+        let token_hash = hash_token(&token);
+        let registration_json = serde_json::to_vec(&registration)?;
+        let registration_ciphertext = self
+            .config
+            .secret_protector
+            .seal(&pending_secret_context(&token_hash), &registration_json)?;
         let mut client = self.lock_client()?;
-        client.execute(
-            "INSERT INTO bpc_pending(token_hash,registration,requested_at_ms,expires_at_ms) VALUES($1,$2,$3,$4)",
-            &[&hash_token(&token), &registration_json, &to_i64(now_ms)?, &to_i64(expires)?],
-        ).map_err(pg_error)?;
+        let mut tx = self.begin(&mut client)?;
+        tx.execute(
+            "DELETE FROM bpc_pending WHERE expires_at_ms < $1",
+            &[&to_i64(now_ms)?],
+        )
+        .map_err(pg_error)?;
+        let pending_count: i64 = tx
+            .query_one("SELECT count(*) FROM bpc_pending", &[])
+            .map_err(pg_error)?
+            .get(0);
+        if u64::try_from(pending_count)
+            .map_err(|_| BpcError::PairRegistry("pending pair count is invalid".into()))?
+            >= self.config.max_pending_pairs
+        {
+            tx.commit().map_err(pg_error)?;
+            return Err(BpcError::PairRegistry(
+                "maximum pending pairing capacity reached".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO bpc_pending(token_hash,registration_ciphertext,requested_at_ms,expires_at_ms) VALUES($1,$2,$3,$4)",
+            &[&token_hash, &registration_ciphertext, &to_i64(now_ms)?, &to_i64(expires)?],
+        )
+        .map_err(pg_error)?;
+        tx.commit().map_err(pg_error)?;
         Ok(token)
     }
 
@@ -282,7 +479,7 @@ impl PairAuthority for PostgresPairAuthority {
         tx.query_one("SELECT pg_advisory_xact_lock(842321904)", &[])
             .map_err(pg_error)?;
         let pending = tx.query_opt(
-            "SELECT registration, expires_at_ms FROM bpc_pending WHERE token_hash=$1 FOR UPDATE",
+            "SELECT registration_ciphertext, expires_at_ms FROM bpc_pending WHERE token_hash=$1 FOR UPDATE",
             &[&token_hash],
         ).map_err(pg_error)?;
         let Some(pending) = pending else {
@@ -301,8 +498,12 @@ impl PairAuthority for PostgresPairAuthority {
             tx.commit().map_err(pg_error)?;
             return Err(BpcError::PairRegistry("approval token has expired".into()));
         }
-        let registration_value: Value = pending.get("registration");
-        let registration: PairRegistration = serde_json::from_value(registration_value)?;
+        let registration_ciphertext: String = pending.get("registration_ciphertext");
+        let registration_json = self.config.secret_protector.open(
+            &pending_secret_context(&token_hash),
+            &registration_ciphertext,
+        )?;
+        let registration: PairRegistration = serde_json::from_slice(&registration_json)?;
         registration.validate()?;
         let active: i64 = tx
             .query_one("SELECT count(*) FROM bpc_pairs WHERE status='active'", &[])
@@ -335,7 +536,7 @@ impl PairAuthority for PostgresPairAuthority {
             kind: registration.kind,
             canary_class: registration.canary_class,
         };
-        insert_pair(&mut tx, &pair)?;
+        insert_pair(&mut tx, &pair, &self.config.secret_protector)?;
         let deleted = tx
             .execute(
                 "DELETE FROM bpc_pending WHERE token_hash=$1",
@@ -383,7 +584,7 @@ impl PairAuthority for PostgresPairAuthority {
             tx.commit().map_err(pg_error)?;
             return Ok(false);
         };
-        let current = row_to_pair(row)?;
+        let current = row_to_pair(row, &self.config.secret_protector)?;
         if current != *expected_old || current.status != PairStatus::Active {
             tx.commit().map_err(pg_error)?;
             return Ok(false);
@@ -403,7 +604,7 @@ impl PairAuthority for PostgresPairAuthority {
         if updated != 1 {
             return Err(BpcError::PairRegistry("rotation CAS failed".into()));
         }
-        insert_pair(&mut tx, &replacement)?;
+        insert_pair(&mut tx, &replacement, &self.config.secret_protector)?;
         tx.commit().map_err(pg_error)?;
         Ok(true)
     }
@@ -434,18 +635,38 @@ impl PairAuthority for PostgresPairAuthority {
 /// singleton head row so concurrent appenders receive deterministic sequences.
 pub struct PostgresAuditLog {
     client: Mutex<Client>,
+    schema: String,
 }
 
 impl PostgresAuditLog {
+    /// Connects only to a loopback audit endpoint without TLS for isolated tests.
+    /// Production callers must use [`Self::connect_tls`].
     pub fn connect(url: &str, schema: impl Into<String>) -> Result<Self> {
         let schema = schema.into();
         if !is_schema_name(&schema) {
             return Err(BpcError::PairRegistry("invalid audit schema name".into()));
         }
+        require_loopback_database(url)?;
         let mut client = Client::connect(url, NoTls).map_err(pg_error)?;
         set_schema(&mut client, &schema)?;
         Ok(Self {
             client: Mutex::new(client),
+            schema,
+        })
+    }
+
+    /// Connects an audit chain through verified PostgreSQL TLS.
+    pub fn connect_tls(url: &str, schema: impl Into<String>) -> Result<Self> {
+        let schema = schema.into();
+        if !is_schema_name(&schema) {
+            return Err(BpcError::PairRegistry("invalid audit schema name".into()));
+        }
+        require_verified_postgres_tls(url)?;
+        let mut client = connect_postgres_tls(url)?;
+        set_schema(&mut client, &schema)?;
+        Ok(Self {
+            client: Mutex::new(client),
+            schema,
         })
     }
 
@@ -454,6 +675,8 @@ impl PostgresAuditLog {
             .client
             .lock()
             .map_err(|_| BpcError::PairRegistry("PostgreSQL audit client lock poisoned".into()))?;
+        ensure_schema(&mut client, &self.schema)?;
+        set_schema(&mut client, &self.schema)?;
         client.batch_execute(POSTGRES_SCHEMA).map_err(pg_error)
     }
 }
@@ -533,13 +756,21 @@ impl AuditLog for PostgresAuditLog {
     }
 }
 
-fn insert_pair(tx: &mut Transaction<'_>, pair: &PairRecord) -> Result<()> {
+fn insert_pair(
+    tx: &mut Transaction<'_>,
+    pair: &PairRecord,
+    secret_protector: &PostgresSecretProtector,
+) -> Result<()> {
     pair.validate()?;
     let jwk = serde_json::to_value(&pair.public_jwk)?;
+    let request_hmac_ciphertext = secret_protector.seal(
+        &pair_secret_context(&pair.id),
+        pair.request_hmac_key.as_bytes(),
+    )?;
     let rows = tx.execute(
-        "INSERT INTO bpc_pairs(id,name,scope,mode,request_hmac_key,public_jwk,status,created_at_ms,expires_at_ms,max_requests,requests,failed_signatures,authorization_version,kind,canary_class)
+        "INSERT INTO bpc_pairs(id,name,scope,mode,request_hmac_ciphertext,public_jwk,status,created_at_ms,expires_at_ms,max_requests,requests,failed_signatures,authorization_version,kind,canary_class)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
-        &[&pair.id, &pair.name, &scope_text(pair.scope), &mode_text(pair.mode), &pair.request_hmac_key, &jwk,
+        &[&pair.id, &pair.name, &scope_text(pair.scope), &mode_text(pair.mode), &request_hmac_ciphertext, &jwk,
           &status_text(pair.status), &to_i64(pair.created_at_ms)?, &option_i64(pair.expires_at_ms)?, &option_i64(pair.max_requests)?,
           &to_i64(pair.requests)?, &i32::try_from(pair.failed_signatures).map_err(|_| BpcError::PairRegistry("failed signatures overflow".into()))?,
           &to_i64(pair.authorization_version)?, &kind_text(pair.kind), &pair.canary_class.map(canary_text)],
@@ -552,15 +783,21 @@ fn insert_pair(tx: &mut Transaction<'_>, pair: &PairRecord) -> Result<()> {
     Ok(())
 }
 
-fn row_to_pair(row: Row) -> Result<PairRecord> {
+fn row_to_pair(row: Row, secret_protector: &PostgresSecretProtector) -> Result<PairRecord> {
     let jwk: Value = row.get("public_jwk");
     let public_jwk: PublicJwk = serde_json::from_value(jwk)?;
+    let id: String = row.get("id");
+    let request_hmac_ciphertext: String = row.get("request_hmac_ciphertext");
+    let request_hmac_key = String::from_utf8(
+        secret_protector.open(&pair_secret_context(&id), &request_hmac_ciphertext)?,
+    )
+    .map_err(|_| BpcError::PairRegistry("stored PostgreSQL verifier key is not UTF-8".into()))?;
     let pair = PairRecord {
-        id: row.get("id"),
+        id,
         name: row.get("name"),
         scope: parse_scope(&row.get::<_, String>("scope"))?,
         mode: parse_mode(&row.get::<_, String>("mode"))?,
-        request_hmac_key: row.get("request_hmac_key"),
+        request_hmac_key,
         public_jwk,
         status: parse_status(&row.get::<_, String>("status"))?,
         created_at_ms: from_i64(row.get("created_at_ms"))?,
@@ -622,6 +859,19 @@ fn hash_token(token: &str) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+fn pair_secret_context(pair_id: &str) -> String {
+    format!("bpc-postgres-pair-hmac-v1:{pair_id}")
+}
+fn pending_secret_context(token_hash: &str) -> String {
+    format!("bpc-postgres-pending-registration-v1:{token_hash}")
+}
+fn is_key_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
 fn to_i64(value: u64) -> Result<i64> {
     i64::try_from(value)
         .map_err(|_| BpcError::PairRegistry("integer exceeds PostgreSQL BIGINT".into()))
@@ -637,6 +887,91 @@ fn option_from_i64(value: Option<i64>) -> Result<Option<u64>> {
 }
 fn pg_error(error: postgres::Error) -> BpcError {
     BpcError::PairRegistry(format!("PostgreSQL error: {error}"))
+}
+
+fn require_loopback_database(connection_url: &str) -> Result<()> {
+    let parsed = url::Url::parse(connection_url)
+        .map_err(|_| BpcError::PairRegistry("PostgreSQL connection URL is invalid".into()))?;
+    if !matches!(parsed.scheme(), "postgres" | "postgresql") || !is_loopback_host(parsed.host_str())
+    {
+        return Err(BpcError::PairRegistry(
+            "plaintext PostgreSQL is restricted to an explicit loopback endpoint; use connect_tls with sslmode=verify-full".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_verified_postgres_tls(connection_url: &str) -> Result<()> {
+    let parsed = url::Url::parse(connection_url)
+        .map_err(|_| BpcError::PairRegistry("PostgreSQL connection URL is invalid".into()))?;
+    let verify_full = parsed
+        .query_pairs()
+        .any(|(key, value)| key == "sslmode" && value.eq_ignore_ascii_case("verify-full"));
+    if !matches!(parsed.scheme(), "postgres" | "postgresql") || !verify_full {
+        return Err(BpcError::PairRegistry(
+            "PostgreSQL TLS URL must use sslmode=verify-full".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn connect_postgres_tls(connection_url: &str) -> Result<Client> {
+    // Reqwest and PostgreSQL TLS can enable different Rustls providers in an
+    // all-feature build. Explicitly select AWS-LC before constructing any TLS
+    // config so Rustls never panics while resolving a process-global default.
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let loaded = rustls_native_certs::load_native_certs();
+    if !loaded.errors.is_empty() {
+        return Err(BpcError::PairRegistry(
+            "could not load complete PostgreSQL TLS trust store".into(),
+        ));
+    }
+    let mut roots = RootCertStore::empty();
+    for certificate in loaded.certs {
+        roots.add(certificate).map_err(|_| {
+            BpcError::PairRegistry("could not add PostgreSQL TLS trust anchor".into())
+        })?;
+    }
+    if roots.is_empty() {
+        return Err(BpcError::PairRegistry(
+            "PostgreSQL TLS trust store contains no certificates".into(),
+        ));
+    }
+    let mut tls_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    set_postgresql_alpn(&mut tls_config);
+    // tokio-postgres exposes only disable/prefer/require, not libpq's
+    // `verify-full`. We already enforced verify-full at our public boundary and
+    // make Rustls verify the chain and hostname, so translate only for its URL
+    // parser without weakening the actual TLS verifier.
+    let driver_url = postgres_driver_tls_url(connection_url)?;
+    Client::connect(
+        &driver_url,
+        MakeTlsConnector::new(TlsConnector::from(std::sync::Arc::new(tls_config))),
+    )
+    .map_err(pg_error)
+}
+
+fn postgres_driver_tls_url(connection_url: &str) -> Result<String> {
+    let mut parsed = url::Url::parse(connection_url)
+        .map_err(|_| BpcError::PairRegistry("PostgreSQL connection URL is invalid".into()))?;
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    {
+        let mut query = parsed.query_pairs_mut();
+        query.clear();
+        for (key, value) in pairs {
+            query.append_pair(&key, if key == "sslmode" { "require" } else { &value });
+        }
+    }
+    Ok(parsed.into())
+}
+
+fn is_loopback_host(host: Option<&str>) -> bool {
+    matches!(host, Some("localhost") | Some("127.0.0.1") | Some("::1"))
 }
 
 fn parse_scope(value: &str) -> Result<Scope> {
@@ -751,4 +1086,58 @@ fn set_schema(client: &mut Client, schema: &str) -> Result<()> {
     client
         .batch_execute(&format!("SET search_path TO {schema}, pg_catalog"))
         .map_err(pg_error)
+}
+
+fn ensure_schema(client: &mut Client, schema: &str) -> Result<()> {
+    // Schema names are accepted only after `is_schema_name` validation in each
+    // constructor/configuration path, so this identifier interpolation is safe.
+    client
+        .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+        .map_err(pg_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PostgresSecretProtector, pair_secret_context, require_loopback_database,
+        require_verified_postgres_tls,
+    };
+
+    #[test]
+    fn verifier_secret_envelope_is_context_bound_and_tamper_evident() {
+        let protector = PostgresSecretProtector::new("unit-key-v1", [42; 32]).unwrap();
+        let context = pair_secret_context("pair_one");
+        let envelope = protector.seal(&context, b"verifier-secret").unwrap();
+        assert!(envelope.starts_with("v1.unit-key-v1."));
+        assert_eq!(
+            protector.open(&context, &envelope).unwrap(),
+            b"verifier-secret"
+        );
+        assert!(
+            protector
+                .open(&pair_secret_context("pair_two"), &envelope)
+                .is_err()
+        );
+        let mut tampered = envelope;
+        tampered.push('A');
+        assert!(protector.open(&context, &tampered).is_err());
+    }
+
+    #[test]
+    fn plaintext_postgres_is_loopback_only_and_tls_requires_full_verification() {
+        assert!(require_loopback_database("postgres://user:pass@127.0.0.1/db").is_ok());
+        assert!(require_loopback_database("postgres://user:pass@db.example.test/db").is_err());
+        assert!(
+            require_verified_postgres_tls(
+                "postgres://user:pass@db.example.test/db?sslmode=verify-full"
+            )
+            .is_ok()
+        );
+        assert!(
+            require_verified_postgres_tls(
+                "postgres://user:pass@db.example.test/db?sslmode=require"
+            )
+            .is_err()
+        );
+    }
 }

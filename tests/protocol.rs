@@ -5,10 +5,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bpc_protocol::{
     AuditAction, AuditEvent, AuditHead, AuditLog, AuditSeverity, BpcKeyPair, BpcRequest,
-    BpcVerifier, CanaryClass, MemoryAuditLog, MemoryNonceStore, MemoryPairAuthority,
-    MemoryPairRegistry, PairKind, PairMode, PairRecord, PairRegistry, PairStatus, Scope,
-    VerificationError, derive_request_hmac_key, sign_request_at, sign_rotation_at,
-    verify_and_rotate_at,
+    BpcVerifier, BpcVerifierConfig, CanaryClass, MemoryAuditLog, MemoryNonceStore,
+    MemoryPairAuthority, MemoryPairRegistry, PairKind, PairMode, PairRecord, PairRegistry,
+    PairStatus, Scope, VerificationError, derive_request_hmac_key, sign_request_at,
+    sign_rotation_at, verify_and_rotate_at,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -117,6 +117,104 @@ fn a_forged_signature_does_not_burn_the_nonce() {
         NOW,
     );
     assert!(valid.ok, "{valid:?}");
+}
+
+#[test]
+fn pair_id_only_junk_cannot_lock_a_credential() {
+    let (registry, _keypair, nonces) = setup(PairKind::Legitimate);
+    let verifier = BpcVerifier::new(BpcVerifierConfig {
+        signature_window_ms: 60_000,
+        lockout_after: 2,
+    });
+    for _ in 0..20 {
+        let denied = verifier.verify_at(
+            BpcRequest {
+                pair_id: PAIR_ID,
+                signature: "not-a-signature",
+                signed_data: "not-base64url-json",
+                version: bpc_protocol::BPC_PROTOCOL_VERSION,
+                method: "POST",
+                path: "/v1/widgets?from=test",
+                body: b"{}",
+            },
+            registry.as_ref(),
+            &nonces,
+            NOW,
+        );
+        assert_eq!(denied.error, Some(VerificationError::InvalidSignedData));
+    }
+    let pair = registry.get(PAIR_ID).unwrap().unwrap();
+    assert_eq!(pair.status, PairStatus::Active);
+    assert_eq!(pair.failed_signatures, 0);
+}
+
+#[test]
+fn only_proven_secret_factor_failures_count_toward_lockout() {
+    let (registry, keypair, nonces) = setup(PairKind::Legitimate);
+    let (body, headers) = signed_request(&keypair);
+    let verifier = BpcVerifier::new(BpcVerifierConfig {
+        signature_window_ms: 60_000,
+        lockout_after: 2,
+    });
+    let mut forged = headers.clone();
+    forged.signature.push('A');
+    for _ in 0..2 {
+        let denied = verifier.verify_at(
+            BpcRequest {
+                pair_id: &forged.pair_id,
+                signature: &forged.signature,
+                signed_data: &forged.signed_data,
+                version: &forged.version,
+                method: "POST",
+                path: "/v1/widgets?from=test",
+                body: &body,
+            },
+            registry.as_ref(),
+            &nonces,
+            NOW,
+        );
+        assert_eq!(denied.error, Some(VerificationError::InvalidSignature));
+    }
+    assert_eq!(
+        registry.get(PAIR_ID).unwrap().unwrap().status,
+        PairStatus::Locked
+    );
+}
+
+#[test]
+fn zero_lockout_threshold_disables_credential_lockout_consistently() {
+    let (registry, keypair, nonces) = setup(PairKind::Legitimate);
+    let (body, headers) = signed_request(&keypair);
+    let verifier = BpcVerifier::new(BpcVerifierConfig {
+        signature_window_ms: 60_000,
+        lockout_after: 0,
+    });
+    let mut forged = headers.clone();
+    forged.signature.push('A');
+    for _ in 0..3 {
+        assert_eq!(
+            verifier
+                .verify_at(
+                    BpcRequest {
+                        pair_id: &forged.pair_id,
+                        signature: &forged.signature,
+                        signed_data: &forged.signed_data,
+                        version: &forged.version,
+                        method: "POST",
+                        path: "/v1/widgets?from=test",
+                        body: &body,
+                    },
+                    registry.as_ref(),
+                    &nonces,
+                    NOW,
+                )
+                .error,
+            Some(VerificationError::InvalidSignature)
+        );
+    }
+    let pair = registry.get(PAIR_ID).unwrap().unwrap();
+    assert_eq!(pair.status, PairStatus::Active);
+    assert_eq!(pair.failed_signatures, 0);
 }
 
 #[test]

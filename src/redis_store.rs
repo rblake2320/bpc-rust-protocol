@@ -83,6 +83,9 @@ pub struct GovernedRedisNonceConfig {
     pub continuity_allowance_ms: u64,
     /// Maximum duration of each blocking Redis command.
     pub command_timeout: Duration,
+    /// Allows `redis://` only for a literal loopback host in isolated tests or
+    /// local development. Production defaults to verified `rediss://`.
+    pub allow_insecure_loopback: bool,
 }
 
 impl GovernedRedisNonceConfig {
@@ -98,6 +101,7 @@ impl GovernedRedisNonceConfig {
             safety_buffer_ms: DEFAULT_SAFETY_BUFFER_MS,
             continuity_allowance_ms: DEFAULT_CONTINUITY_ALLOWANCE_MS,
             command_timeout: Duration::from_secs(2),
+            allow_insecure_loopback: false,
         };
         config.validate()?;
         Ok(config)
@@ -156,6 +160,7 @@ impl GovernedRedisNonceStore {
     /// Connects and proves the Redis server uses `maxmemory-policy noeviction`.
     pub fn connect(url: &str, config: GovernedRedisNonceConfig) -> Result<Self> {
         config.validate()?;
+        require_secure_redis_transport(url, &config)?;
         let client = Client::open(url).map_err(redis_error)?;
         let mut connection = client.get_connection().map_err(redis_error)?;
         let timeout = config.command_timeout;
@@ -349,6 +354,24 @@ fn assert_noeviction(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn require_secure_redis_transport(url: &str, config: &GovernedRedisNonceConfig) -> Result<()> {
+    let parsed = url::Url::parse(url)
+        .map_err(|_| BpcError::NonceStore("Redis connection URL is invalid".into()))?;
+    if parsed.scheme() == "rediss" {
+        return Ok(());
+    }
+    let loopback = matches!(
+        parsed.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("::1")
+    );
+    if parsed.scheme() == "redis" && config.allow_insecure_loopback && loopback {
+        return Ok(());
+    }
+    Err(BpcError::NonceStore(
+        "Redis must use rediss://; redis:// is available only for explicit literal-loopback development".into(),
+    ))
+}
+
 fn redis_error(error: redis::RedisError) -> BpcError {
     BpcError::NonceStore(format!("Redis unavailable: {error}"))
 }
@@ -365,4 +388,28 @@ fn is_namespace(value: &str) -> bool {
 
 fn is_epoch_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GovernedRedisNonceConfig, require_secure_redis_transport};
+
+    #[test]
+    fn redis_transport_requires_tls_except_explicit_literal_loopback() {
+        let config = GovernedRedisNonceConfig::new("bpc-test", "epoch-1", 60_000).unwrap();
+        assert!(
+            require_secure_redis_transport("rediss://cache.example.test:6380/", &config).is_ok()
+        );
+        assert!(
+            require_secure_redis_transport("redis://cache.example.test:6379/", &config).is_err()
+        );
+        assert!(require_secure_redis_transport("redis://127.0.0.1:6379/", &config).is_err());
+
+        let mut local = config;
+        local.allow_insecure_loopback = true;
+        assert!(require_secure_redis_transport("redis://127.0.0.1:6379/", &local).is_ok());
+        assert!(
+            require_secure_redis_transport("redis://cache.example.test:6379/", &local).is_err()
+        );
+    }
 }

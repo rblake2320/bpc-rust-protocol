@@ -14,8 +14,21 @@ use axum::http::{HeaderMap, StatusCode, header::HeaderName};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
+use tokio::sync::Semaphore;
 
 use crate::{AuthSnapshot, BpcRequest, BpcVerifier, NonceStore, PairRegistry, VerificationError};
+
+/// Controls the error-code detail disclosed to an untrusted HTTP caller.
+///
+/// [`Self::Generic`] is the production-safe default. The verifier still returns
+/// its precise error to trusted in-process telemetry, but the public response
+/// never reveals pair lifecycle, replay, signature, or canary state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BpcPublicErrorDisclosure {
+    #[default]
+    Generic,
+    DetailedForDevelopment,
+}
 
 /// State passed to [`bpc_axum_middleware`].
 pub struct BpcAxumState<R, N> {
@@ -25,6 +38,12 @@ pub struct BpcAxumState<R, N> {
     /// Hard cap before body buffering. Streaming uploads need an application
     /// supplied digest strategy; BPC v1 signs an exact precomputed body digest.
     pub max_body_bytes: usize,
+    /// Bounds requests that can buffer a body before authentication. Keep a
+    /// proxy/server read timeout in front of this adapter as well.
+    body_collection_permits: Arc<Semaphore>,
+    /// Public error behavior. Keep the default in every internet-facing
+    /// deployment; detailed codes exist only for isolated development.
+    pub error_disclosure: BpcPublicErrorDisclosure,
 }
 
 impl<R, N> Clone for BpcAxumState<R, N> {
@@ -34,6 +53,8 @@ impl<R, N> Clone for BpcAxumState<R, N> {
             registry: Arc::clone(&self.registry),
             nonce_store: Arc::clone(&self.nonce_store),
             max_body_bytes: self.max_body_bytes,
+            body_collection_permits: Arc::clone(&self.body_collection_permits),
+            error_disclosure: self.error_disclosure,
         }
     }
 }
@@ -45,7 +66,22 @@ impl<R, N> BpcAxumState<R, N> {
             registry,
             nonce_store,
             max_body_bytes: 2 * 1024 * 1024,
+            body_collection_permits: Arc::new(Semaphore::new(64)),
+            error_disclosure: BpcPublicErrorDisclosure::Generic,
         }
+    }
+
+    /// Sets the maximum number of requests that may buffer a body before BPC
+    /// verification. Zero is rejected because it would permanently deny traffic.
+    pub fn with_body_collection_limit(
+        mut self,
+        max_in_flight: usize,
+    ) -> std::result::Result<Self, &'static str> {
+        if max_in_flight == 0 {
+            return Err("body collection limit must be greater than zero");
+        }
+        self.body_collection_permits = Arc::new(Semaphore::new(max_in_flight));
+        Ok(self)
     }
 }
 
@@ -76,6 +112,13 @@ where
         Ok(value) => value,
         Err(code) => return error_response(StatusCode::BAD_REQUEST, code),
     };
+    if declared_body_is_too_large(&parts.headers, state.max_body_bytes) {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large");
+    }
+    let _permit = match Arc::clone(&state.body_collection_permits).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "authentication_busy"),
+    };
     let body = match to_bytes(body, state.max_body_bytes).await {
         Ok(bytes) => bytes,
         Err(_) => return error_response(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"),
@@ -100,7 +143,10 @@ where
     );
     if !result.ok {
         let error = result.error.expect("denial contains an error");
-        return error_response(status_for(error), public_code(error));
+        return error_response(
+            status_for(error, state.error_disclosure),
+            public_code(error, state.error_disclosure),
+        );
     }
     let snapshot = result.snapshot.expect("success contains an auth snapshot");
     let mut restored = Request::from_parts(parts, Body::from(body));
@@ -126,7 +172,33 @@ fn unique_header(
         .map_err(|_| "invalid_bpc_header")
 }
 
-fn status_for(error: VerificationError) -> StatusCode {
+fn declared_body_is_too_large(headers: &HeaderMap, max_body_bytes: usize) -> bool {
+    let mut values = headers.get_all("content-length").iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return true;
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_none_or(|declared| declared > max_body_bytes)
+}
+
+fn status_for(error: VerificationError, disclosure: BpcPublicErrorDisclosure) -> StatusCode {
+    if disclosure == BpcPublicErrorDisclosure::Generic {
+        return match error {
+            VerificationError::MissingHeaders
+            | VerificationError::InvalidMethod
+            | VerificationError::InvalidSignedData
+            | VerificationError::VersionMismatch
+            | VerificationError::MissingBodyHash => StatusCode::BAD_REQUEST,
+            VerificationError::ReplayStoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::UNAUTHORIZED,
+        };
+    }
     match error {
         VerificationError::MissingHeaders
         | VerificationError::InvalidMethod
@@ -139,7 +211,18 @@ fn status_for(error: VerificationError) -> StatusCode {
     }
 }
 
-fn public_code(error: VerificationError) -> &'static str {
+fn public_code(error: VerificationError, disclosure: BpcPublicErrorDisclosure) -> &'static str {
+    if disclosure == BpcPublicErrorDisclosure::Generic {
+        return match error {
+            VerificationError::MissingHeaders
+            | VerificationError::InvalidMethod
+            | VerificationError::InvalidSignedData
+            | VerificationError::VersionMismatch
+            | VerificationError::MissingBodyHash => "invalid_request",
+            VerificationError::ReplayStoreUnavailable => "authentication_temporarily_unavailable",
+            _ => "unauthorized",
+        };
+    }
     // A canary is an internal detection mechanism, not attacker-facing state.
     if error == VerificationError::GhostPairDenied {
         "unauthorized"
