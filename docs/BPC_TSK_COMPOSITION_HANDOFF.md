@@ -6,10 +6,10 @@ Use these two **standalone** protocol repositories as immutable baselines for th
 
 | Component | Repository | Pin for the new chat |
 | --- | --- | --- |
-| BPC Rust | <https://github.com/rblake2320/bpc-rust-protocol> | `c4779b592e3340da3fed002e13e8655ddd423941` |
+| BPC Rust | <https://github.com/rblake2320/bpc-rust-protocol> | `8ae6793202a1295c14c91d62d68994ce36409909` |
 | TSK Rust | <https://github.com/rblake2320/tsk-rust-protocol> | `c050aa17361afdf819700029f09669e9cbbc576f` |
 
-Both repositories are private. The BPC repository is a self-contained BPC v1 crate with production Axum/Redis/PostgreSQL adapters. The current TSK Rust checkpoint is deliberately **not production-ready**; its own README lists parity gates that must remain visible in any combined release decision.
+Both repositories are private. The BPC pin was deliberately re-reviewed as the BPC v2 request-bound baseline. The BPC repository is a self-contained BPC v2 crate with production Axum/Redis/PostgreSQL adapters. The current TSK Rust checkpoint is deliberately **not production-ready**; its own README lists parity gates that must remain visible in any combined release decision.
 
 ## Target architecture
 
@@ -21,7 +21,7 @@ bpc-protocol (standalone)  ─┐
  tsk-rust-protocol (standalone) ─┘
 ```
 
-The bridge may depend on the pinned releases of both crates. Neither standalone crate may depend on the other, import the other’s secret types, or change its v1 wire format merely to support composition. The bridge owns HTTP orchestration, durable principal/binding policy, combined audit records, and application-facing authorization snapshots.
+The bridge may depend on the pinned releases of both crates. Neither standalone crate may depend on the other or import the other’s secret types. The bridge owns HTTP orchestration, durable principal/binding policy, combined audit records, and application-facing authorization snapshots.
 
 ## Non-negotiable security contract
 
@@ -30,7 +30,7 @@ The bridge may depend on the pinned releases of both crates. Neither standalone 
 3. **Use a server-controlled identity binding.** Persist an append-only/revisioned mapping of `{bpc_pair_id, tsk_client_id, principal_id, binding_revision, status}` in the bridge authority. It must be created by privileged control-plane workflow, never asserted by client headers.
 4. **Require both factors.** On a protected combined endpoint: validate BPC first against exact raw method, `path_and_query`, and body bytes; load the durable active binding; require the submitted TSK client ID to equal the mapped ID; validate/commit TSK; then expose a combined application snapshot. Any failure denies the request.
 5. **No rollback of spent security artifacts.** A valid BPC nonce or TSK HOTP value consumed before the other factor fails remains consumed. Do not retry or compensate it. The business side effect happens only after both factors succeed and must use a separate server-side idempotency/transaction boundary.
-6. **Be precise about request binding.** BPC v1 cryptographically binds method/path/body. The current TSK v1 checkpoint authenticates its header credential but does not independently bind those request fields. The bridge must describe TSK as an independent second factor — not a second message signature. Any TSK request-context binding requires a versioned TSK protocol evolution with explicit cross-language vectors.
+6. **Be precise about request binding.** Require BPC v2: its two factors cryptographically bind audience, mode, method, exact path, body hash, nonce, timestamp, pair ID, purpose, and version. The current TSK v1 checkpoint authenticates its header credential but does not independently bind those request fields. The bridge must describe TSK as an independent second factor — not a second message signature. Any TSK request-context binding requires a versioned TSK protocol evolution with explicit cross-language vectors.
 7. **Fail closed on authority uncertainty.** Preserve BPC’s Redis continuity quarantine and PostgreSQL final-claim semantics. Port TSK’s required durable/HA gates before claiming the combined bridge is production-ready. Do not use process-local maps or mock-only tests as authority.
 8. **Audit without secrets.** Emit one correlation ID and a domain-separated request-context digest to protected audit systems. Never record raw BPC signatures, signed payloads, JWKs, registration secrets, or TSK keys.
 
@@ -62,12 +62,12 @@ Do not release the combined bridge until it has real-service tests covering at m
 ```text
 Build a third private Rust repository named bpc-tsk-bridge that composes, but does not merge, these standalone repositories:
 
-- BPC: https://github.com/rblake2320/bpc-rust-protocol at commit c4779b592e3340da3fed002e13e8655ddd423941
+- BPC: https://github.com/rblake2320/bpc-rust-protocol at commit 8ae6793202a1295c14c91d62d68994ce36409909
 - TSK: https://github.com/rblake2320/tsk-rust-protocol at commit c050aa17361afdf819700029f09669e9cbbc576f
 
 Read docs/BPC_TSK_COMPOSITION_HANDOFF.md from the BPC repository before coding. Preserve both protocol crates as standalone packages with no circular dependency. The new bridge owns a durable server-controlled mapping from BPC pair ID to TSK client ID to principal ID, combined verification, generic public failures, protected audit correlation, and real PostgreSQL/Redis tests.
 
-Use BPC first to bind exact method/path/body and consume its nonce; then check the active binding and TSK credential. Both factors are required. Do not combine or derive cryptographic secrets across protocols, do not call it “ultra encryption,” do not roll back a consumed nonce/HOTP value, and do not claim production readiness until TSK’s documented durable/HA parity gates have been completed. Use TLS 1.3 for transport confidentiality and standard AEAD/KMS only for separately encrypted storage.
+Use BPC v2 first to bind exact audience/mode/method/path/body and consume its nonce; then check the active binding and TSK credential. Both factors are required. Do not enable BPC v1 compatibility in the bridge. Do not combine or derive cryptographic secrets across protocols, do not call it “ultra encryption,” do not roll back a consumed nonce/HOTP value, and do not claim production readiness until TSK’s documented durable/HA parity gates have been completed. Use TLS 1.3 for transport confidentiality and standard AEAD/KMS only for separately encrypted storage.
 
 Deliver the bridge as a third private repo with architecture docs, an ADR, threat model, migration plan, CI, independent vectors, adversarial race tests, and a production-readiness checklist.
 ```
