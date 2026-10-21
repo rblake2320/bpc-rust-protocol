@@ -546,16 +546,16 @@ impl PairRegistry for MemoryPairRegistry {
     }
 
     fn record_failure(&self, pair_id: &str, lockout_after: u32) -> Result<()> {
+        if lockout_after == 0 {
+            return Ok(());
+        }
         let mut pairs = self
             .pairs
             .lock()
             .map_err(|_| BpcError::PairRegistry("memory registry lock poisoned".into()))?;
         if let Some(pair) = pairs.get_mut(pair_id) {
             pair.failed_signatures = pair.failed_signatures.saturating_add(1);
-            if lockout_after > 0
-                && pair.failed_signatures >= lockout_after
-                && pair.status == PairStatus::Active
-            {
+            if pair.failed_signatures >= lockout_after && pair.status == PairStatus::Active {
                 pair.status = PairStatus::Locked;
                 pair.authorization_version = pair.authorization_version.saturating_add(1);
             }

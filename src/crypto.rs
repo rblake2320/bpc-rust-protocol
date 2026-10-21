@@ -4,6 +4,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use p256::ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 use crate::authority::canonical_rotation_bytes;
@@ -12,6 +13,8 @@ use crate::{BpcError, BpcPayload, PublicJwk, Result, RotationPayload};
 
 const HKDF_SALT: &[u8] = b"bpc-protocol-hmac-salt-v1";
 const HKDF_INFO: &[u8] = b"bpc-v1-hmac-key";
+/// Entropy required for a production BPC registration-secret input.
+pub const HIGH_ASSURANCE_REGISTRATION_SECRET_BYTES: usize = 32;
 
 /// Base64url-encodes bytes without padding, as required by BPC v1.
 pub fn b64url_encode(bytes: impl AsRef<[u8]>) -> String {
@@ -48,6 +51,45 @@ pub fn derive_request_hmac_key(secret: &str) -> Result<String> {
     hkdf.expand(HKDF_INFO, &mut output)
         .map_err(|_| BpcError::InvalidHmacKey)?;
     Ok(b64url_encode(output))
+}
+
+/// Generate an independent, uniformly random 256-bit registration secret in
+/// canonical unpadded base64url form.
+///
+/// Store the returned value in a client-side secret manager or HSM-backed
+/// secret store. It is an authentication factor, not a user password, and must
+/// never be logged, embedded in browser/mobile bundles, or reused for another
+/// protocol.
+pub fn generate_high_assurance_registration_secret() -> String {
+    let mut bytes = [0_u8; HIGH_ASSURANCE_REGISTRATION_SECRET_BYTES];
+    OsRng.fill_bytes(&mut bytes);
+    b64url_encode(bytes)
+}
+
+/// Validate the canonical 256-bit registration-secret representation required
+/// by high-assurance BPC deployments.
+///
+/// This does not prove that an arbitrary derived server HMAC key originated
+/// from this function. The pairing control plane must therefore record and
+/// approve the trusted secret-provisioning path out of band.
+pub fn validate_high_assurance_registration_secret(secret: &str) -> Result<()> {
+    let bytes = b64url_decode(secret)?;
+    if secret.len() != 43
+        || bytes.len() != HIGH_ASSURANCE_REGISTRATION_SECRET_BYTES
+        || b64url_encode(&bytes) != secret
+    {
+        return Err(BpcError::SecretPolicy(
+            "high-assurance registration secret must be exactly 32 random bytes encoded as canonical unpadded base64url".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Derive a BPC request-HMAC key only after enforcing the high-assurance
+/// 256-bit registration-secret representation.
+pub fn derive_high_assurance_request_hmac_key(secret: &str) -> Result<String> {
+    validate_high_assurance_registration_secret(secret)?;
+    derive_request_hmac_key(secret)
 }
 
 /// Computes the BPC request HMAC over `nonce || decimal(timestamp)`.

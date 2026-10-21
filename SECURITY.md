@@ -13,7 +13,8 @@ BPC protects a server from unapproved pair use, request tampering, stale request
 ### Client keys and registration secrets
 
 - Keep P-256 signing keys in a KMS/HSM/platform secure store where possible. `BpcKeyPair` is an in-memory convenience wrapper, not a key-custody system.
-- Store registration secrets in a secret manager. Never log them or place them in browser/mobile bundles.
+- Generate production registration secrets with `generate_high_assurance_registration_secret()` and store them in a separate client-side secret manager. This produces exactly 32 random bytes; legacy password-policy-compliant strings are for BPC v1 compatibility only and do not establish high assurance.
+- Never log registration secrets or place them in browser/mobile bundles. The server derives/stores only an HMAC verifier key, so an approval workflow must retain evidence that the underlying client secret came from the approved provisioning path.
 - Log key fingerprints, not raw JWKs, signed payloads, HMAC values, or signatures.
 - Rotate pairs using `sign_rotation_at`/`verify_and_rotate_at`; do not mutate public keys in place.
 
@@ -41,6 +42,7 @@ BPC protects a server from unapproved pair use, request tampering, stale request
 - Configure a conservative `max_body_bytes`. For streaming requests, design a separate, versioned digest protocol instead of disabling body binding.
 - Do not trust client-provided forwarding headers for source IP. Only derive client IP from a validated trusted-proxy boundary.
 - Rate-limit before expensive P-256 work, including unknown pair IDs and malformed signed payloads.
+- Keep `BpcVerifierConfig::lockout_after` at its default of `0`. Automatic lockout keyed by a pair ID lets unauthenticated malformed traffic become a credential-specific denial-of-service attack. Use edge throttles, protected telemetry, canary pairs, and operator-approved lifecycle actions instead.
 - Return generic stable BPC error codes publicly. Keep details such as canary class, storage status, policy snapshot, and raw parsing failures in protected telemetry only.
 
 ### Audit

@@ -77,8 +77,10 @@ pub use canonical::{
 };
 pub use client::{sign_request, sign_request_at};
 pub use crypto::{
-    b64url_decode, b64url_encode, body_hash, compute_fingerprint, derive_request_hmac_key,
-    request_hmac, sign_payload, sign_rotation_payload, validate_secret, verify_payload,
+    HIGH_ASSURANCE_REGISTRATION_SECRET_BYTES, b64url_decode, b64url_encode, body_hash,
+    compute_fingerprint, derive_high_assurance_request_hmac_key, derive_request_hmac_key,
+    generate_high_assurance_registration_secret, request_hmac, sign_payload, sign_rotation_payload,
+    validate_high_assurance_registration_secret, validate_secret, verify_payload,
     verify_payload_bytes, verify_request_hmac, verify_rotation_payload,
 };
 pub use error::{BpcError, Result};

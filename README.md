@@ -17,6 +17,8 @@ Each accepted request proves all of the following before application authorizati
 - The nonce is a UUID v4 and is fresh; durable Redis protection admits it once only.
 - The pair policy did not change while cryptography/replay checks were in progress; a final version-fenced claim succeeds atomically.
 
+For a high-assurance deployment, the HMAC factor must originate from `generate_high_assurance_registration_secret()`: a canonical, independently random 32-byte secret. The legacy `validate_secret` policy exists only for BPC v1 compatibility and must not be used as evidence of 128- or 256-bit entropy. The server stores only the derived HMAC key, so the pairing control plane must separately record and approve the trusted provisioning path.
+
 ## Features
 
 | Feature | Purpose |
@@ -76,6 +78,21 @@ assert!(decision.ok);
 ```
 
 The in-memory stores are deliberately limited to one process. Do **not** use them behind multiple replicas.
+
+### High-assurance registration secret
+
+```rust
+use bpc_protocol::{
+    derive_high_assurance_request_hmac_key, generate_high_assurance_registration_secret,
+};
+
+let registration_secret = generate_high_assurance_registration_secret();
+let request_hmac_key = derive_high_assurance_request_hmac_key(&registration_secret)?;
+// Store the secret only in the client factor's separate secret manager.
+# Ok::<(), bpc_protocol::BpcError>(())
+```
+
+`BpcVerifierConfig::default()` disables automatic pair lockout. An attacker who knows a pair ID can otherwise submit malformed requests until an automatic lockout causes denial of service. Use per-source and per-pair edge throttles, protected telemetry, and an explicit operator-approved revocation/lock workflow instead. `lockout_after > 0` is an opt-in legacy behavior and is not recommended for exposed endpoints.
 
 ## Production setup
 

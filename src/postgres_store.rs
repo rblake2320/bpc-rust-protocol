@@ -164,6 +164,9 @@ impl PairRegistry for PostgresPairAuthority {
     }
 
     fn record_failure(&self, pair_id: &str, lockout_after: u32) -> Result<()> {
+        if lockout_after == 0 {
+            return Ok(());
+        }
         let mut client = self.lock_client()?;
         let threshold = i32::try_from(lockout_after).map_err(|_| {
             BpcError::PairRegistry("lockout threshold exceeds PostgreSQL range".into())

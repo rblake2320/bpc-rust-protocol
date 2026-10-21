@@ -5,10 +5,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bpc_protocol::{
     AuditAction, AuditEvent, AuditHead, AuditLog, AuditSeverity, BpcKeyPair, BpcRequest,
-    BpcVerifier, CanaryClass, MemoryAuditLog, MemoryNonceStore, MemoryPairAuthority,
-    MemoryPairRegistry, PairKind, PairMode, PairRecord, PairRegistry, PairStatus, Scope,
-    VerificationError, derive_request_hmac_key, sign_request_at, sign_rotation_at,
-    verify_and_rotate_at,
+    BpcVerifier, BpcVerifierConfig, CanaryClass, MemoryAuditLog, MemoryNonceStore,
+    MemoryPairAuthority, MemoryPairRegistry, PairKind, PairMode, PairRecord, PairRegistry,
+    PairStatus, Scope, VerificationError, derive_high_assurance_request_hmac_key,
+    derive_request_hmac_key, generate_high_assurance_registration_secret, sign_request_at,
+    sign_rotation_at, validate_high_assurance_registration_secret, verify_and_rotate_at,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -81,6 +82,15 @@ fn signs_and_verifies_exact_body_and_path() {
 }
 
 #[test]
+fn high_assurance_registration_secret_is_a_canonical_256_bit_value() {
+    let secret = generate_high_assurance_registration_secret();
+    assert_eq!(secret.len(), 43);
+    validate_high_assurance_registration_secret(&secret).unwrap();
+    assert!(derive_high_assurance_request_hmac_key(&secret).is_ok());
+    assert!(validate_high_assurance_registration_secret(SECRET).is_err());
+}
+
+#[test]
 fn a_forged_signature_does_not_burn_the_nonce() {
     let (registry, keypair, nonces) = setup(PairKind::Legitimate);
     let (body, headers) = signed_request(&keypair);
@@ -117,6 +127,63 @@ fn a_forged_signature_does_not_burn_the_nonce() {
         NOW,
     );
     assert!(valid.ok, "{valid:?}");
+}
+
+#[test]
+fn unauthenticated_malformed_traffic_cannot_lock_a_pair_by_default() {
+    let (registry, _keypair, nonces) = setup(PairKind::Legitimate);
+    let verifier = BpcVerifier::default();
+    for _ in 0..100 {
+        let result = verifier.verify_at(
+            BpcRequest {
+                pair_id: PAIR_ID,
+                signature: "not-a-signature",
+                signed_data: "not-a-canonical-payload",
+                version: "1.0",
+                method: "POST",
+                path: "/v1/widgets?from=test",
+                body: b"{}",
+            },
+            registry.as_ref(),
+            &nonces,
+            NOW,
+        );
+        assert_eq!(result.error, Some(VerificationError::InvalidSignedData));
+    }
+    let pair = registry.get(PAIR_ID).unwrap().unwrap();
+    assert_eq!(pair.status, PairStatus::Active);
+    assert_eq!(pair.failed_signatures, 0);
+    assert_eq!(pair.authorization_version, 1);
+}
+
+#[test]
+fn pair_lockout_requires_an_explicit_nondefault_policy() {
+    let (registry, _keypair, nonces) = setup(PairKind::Legitimate);
+    let verifier = BpcVerifier::new(BpcVerifierConfig {
+        signature_window_ms: 60_000,
+        lockout_after: 2,
+    });
+    for _ in 0..2 {
+        let result = verifier.verify_at(
+            BpcRequest {
+                pair_id: PAIR_ID,
+                signature: "not-a-signature",
+                signed_data: "not-a-canonical-payload",
+                version: "1.0",
+                method: "POST",
+                path: "/v1/widgets?from=test",
+                body: b"{}",
+            },
+            registry.as_ref(),
+            &nonces,
+            NOW,
+        );
+        assert_eq!(result.error, Some(VerificationError::InvalidSignedData));
+    }
+    assert_eq!(
+        registry.get(PAIR_ID).unwrap().unwrap().status,
+        PairStatus::Locked
+    );
 }
 
 #[test]

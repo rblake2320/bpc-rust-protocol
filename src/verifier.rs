@@ -14,7 +14,10 @@ const MAX_SIGNED_DATA_LEN: usize = 4096;
 pub struct BpcVerifierConfig {
     /// Permitted difference between verifier and client clocks, in milliseconds.
     pub signature_window_ms: u64,
-    /// Number of failed authenticated verification attempts before a pair locks.
+    /// Number of failures before a pair locks. `0` disables verifier-driven
+    /// pair-state mutation and is the production-safe default: a remote
+    /// attacker can otherwise lock a known pair ID with malformed traffic.
+    /// Enforce anti-abuse with an independently governed edge rate limiter.
     pub lockout_after: u32,
 }
 
@@ -22,7 +25,7 @@ impl Default for BpcVerifierConfig {
     fn default() -> Self {
         Self {
             signature_window_ms: 60_000,
-            lockout_after: 10,
+            lockout_after: 0,
         }
     }
 }
@@ -140,7 +143,7 @@ impl BpcVerifier {
                 );
             }
         }
-        if pair.failed_signatures >= self.config.lockout_after {
+        if self.config.lockout_after > 0 && pair.failed_signatures >= self.config.lockout_after {
             return VerificationResult::denied(
                 Some(request.pair_id),
                 VerificationError::PairLocked,
@@ -165,7 +168,10 @@ impl BpcVerifier {
             );
         }
 
-        // Invalid data for a known active pair counts toward the lockout threshold.
+        // Do not mutate pair state under the default configuration. A lockout
+        // keyed only by a publicly submitted pair ID is an attacker-controlled
+        // availability attack; edge rate limits and protected telemetry are the
+        // required first-line response to invalid traffic.
         let (payload, canonical) = match parse_canonical_payload(request.signed_data) {
             Ok(parsed) => parsed,
             Err(_) => {
@@ -322,7 +328,9 @@ impl BpcVerifier {
         pair_id: &str,
         error: VerificationError,
     ) -> VerificationResult {
-        let _ = registry.record_failure(pair_id, self.config.lockout_after);
+        if self.config.lockout_after > 0 {
+            let _ = registry.record_failure(pair_id, self.config.lockout_after);
+        }
         VerificationResult::denied(Some(pair_id), error)
     }
 }
