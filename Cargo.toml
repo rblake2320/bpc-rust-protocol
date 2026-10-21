@@ -13,14 +13,17 @@ categories = ["authentication", "cryptography", "web-programming"]
 [features]
 default = []
 axum = ["dep:axum", "dep:http", "dep:tokio"]
-redis-store = ["dep:redis"]
+redis-store = ["dep:redis", "dep:rustls", "dep:rustls-native-certs"]
+# Enables the deliberately named loopback-only plaintext Redis constructor for
+# isolated local integration tests. Never enable this feature in production.
+redis-insecure-tests = ["redis-store"]
 postgres-store = ["dep:postgres", "dep:postgres-native-tls", "dep:native-tls"]
 # Enables explicitly named plaintext PostgreSQL constructors for isolated local
 # integration tests. Never enable this feature in a production build.
 postgres-insecure-tests = ["postgres-store"]
 reqwest-client = ["dep:reqwest"]
 production = ["axum", "redis-store", "postgres-store", "reqwest-client"]
-live-integration = ["redis-store", "postgres-store", "postgres-insecure-tests"]
+live-integration = ["redis-store", "redis-insecure-tests", "postgres-store", "postgres-insecure-tests"]
 
 [dependencies]
 axum = { version = "0.8.8", optional = true }
@@ -33,8 +36,12 @@ p256 = { version = "0.13.2", features = ["ecdsa"] }
 postgres = { version = "0.19.12", features = ["with-serde_json-1"], optional = true }
 postgres-native-tls = { version = "0.5.3", optional = true }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
-redis = { version = "0.32.7", optional = true }
+# Redis is intentionally restricted to its verified Rustls path. Do not add
+# `tls-rustls-insecure` or a native-TLS feature here.
+redis = { version = "0.32.7", default-features = false, features = ["tls-rustls"], optional = true }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"], optional = true }
+rustls-native-certs = { version = "0.8.5", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"

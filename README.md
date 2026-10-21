@@ -25,12 +25,13 @@ For a high-assurance deployment, the HMAC factor must originate from `generate_h
 | --- | --- |
 | Core (default) | Canonical BPC v1 payloads, P-256 signing/verification, HKDF/HMAC, strict JWK checks, memory stores for development/tests |
 | `axum` | Exact-body Axum middleware that restores body bytes and injects `AuthSnapshot` only on success |
-| `redis-store` | Governed Redis nonce backend with continuity epoch, fixed horizon, quarantine, `noeviction` enforcement, and fail-closed ambiguity handling |
+| `redis-store` | Governed Redis nonce backend with verified Rustls TLS, continuity epoch, fixed horizon, quarantine, `noeviction` enforcement, and fail-closed ambiguity handling |
+| `redis-insecure-tests` | **Test-only:** exposes `connect_loopback_for_tests` for a pinned local plaintext Redis service; never enable in production |
 | `postgres-store` | TLS-required PostgreSQL pair authority and audit chain with certificate/hostname verification, serializable lifecycle transactions, and one-time hashed approval tokens |
 | `postgres-insecure-tests` | **Test-only:** exposes clearly named `connect_insecure_for_tests` APIs for an isolated local plaintext PostgreSQL service; never enable in production |
 | `reqwest-client` | HTTPS-capable client transport that signs exact transmitted body bytes |
 | `production` | All runtime integrations |
-| `live-integration` | Real Redis/PostgreSQL test gate; enables `postgres-insecure-tests` and requires `BPC_TEST_REDIS_URL` and `BPC_TEST_POSTGRES_URL` |
+| `live-integration` | Real Redis/PostgreSQL test gate; enables both test-only plaintext features and requires `BPC_TEST_REDIS_URL` and `BPC_TEST_POSTGRES_URL` |
 
 ## Install
 
@@ -124,16 +125,31 @@ For an isolated local plaintext PostgreSQL test service only, enable `postgres-i
 The Redis store will only operate when `maxmemory-policy=noeviction`; an eviction-capable Redis instance is unsafe for replay prevention. Configure ACL/TLS/authentication, dedicate the database/cluster tenancy, and grant the `CONFIG GET maxmemory-policy` permission needed for the safety check.
 
 ```rust
-use bpc_protocol::{GovernedRedisNonceConfig, GovernedRedisNonceStore};
+use bpc_protocol::{GovernedRedisNonceConfig, GovernedRedisNonceStore, RedisTlsConfig};
 
 let cfg = GovernedRedisNonceConfig::new("payments-prod", "deploy-epoch-2026-10", 60_000)?;
-let nonce_store = GovernedRedisNonceStore::connect(&std::env::var("BPC_REDIS_URL")?, cfg)?;
+let tls = RedisTlsConfig::default()
+    .with_system_roots(false)
+    .with_additional_root_certificate_pem(std::fs::read("/run/secrets/redis-ca.pem")?)
+    .with_client_auth_pem(
+        std::fs::read("/run/secrets/redis-client-cert.pem")?,
+        std::fs::read("/run/secrets/redis-client-key.pem")?,
+    );
+let nonce_store = GovernedRedisNonceStore::connect_tls_with_config(
+    &std::env::var("BPC_REDIS_URL")?, // e.g. rediss://app@redis.example:6380/0
+    cfg,
+    tls,
+)?;
 
 // On a new namespace or epoch mismatch this deliberately returns a quarantine error.
 // After the configured horizon, run this from a serialized readiness/reconciliation task.
 nonce_store.provision_epoch()?;
 nonce_store.reconcile()?;
 ```
+
+`connect_tls` accepts only one `rediss://` TCP endpoint and uses Redis 0.32's Rustls backend with system trust roots, certificate validation, and hostname verification. `connect_tls_with_config` additionally accepts bounded PEM or DER private CA roots and an optional paired mTLS client certificate/key, while retaining Rustls's standard certificate and hostname verifier. Use `with_system_roots(false)` with an explicit private CA to make that CA the complete trust set. Both constructors reject `redis://`, Unix sockets, alternate/multi-host targets, URL fragments (including `#insecure`), and verification bypasses. Do not bypass certificate or hostname verification.
+
+For an isolated local plaintext test service only, enable `redis-insecure-tests` and call `connect_loopback_for_tests`. It accepts only `redis://localhost`, a literal `127.0.0.0/8` address, or `::1`; it rewrites `localhost` to `127.0.0.1` before connecting so a resolver cannot route the plaintext connection remotely. The normal `redis-store` and `production` feature sets do not expose that constructor.
 
 A Redis timeout has an ambiguous outcome: Redis may have consumed the nonce after the client timed out. The store closes a local gate on any such error and must be explicitly reconciled; it never retries/accepts an uncertain nonce operation.
 
@@ -147,7 +163,7 @@ use axum::{middleware, Router};
 use bpc_protocol::{bpc_axum_middleware, BpcAxumState, BpcVerifier};
 
 # let authority = Arc::new(bpc_protocol::PostgresPairAuthority::connect_tls("postgres://app@db.example/bpc?sslmode=require", bpc_protocol::PostgresAuthorityConfig::default(), bpc_protocol::PostgresTlsConfig::default())?);
-# let nonce_store = Arc::new(bpc_protocol::GovernedRedisNonceStore::connect("redis://...", bpc_protocol::GovernedRedisNonceConfig::new("example", "epoch-1", 60_000)?)?);
+# let nonce_store = Arc::new(bpc_protocol::GovernedRedisNonceStore::connect_tls("rediss://redis.example:6380/0", bpc_protocol::GovernedRedisNonceConfig::new("example", "epoch-1", 60_000)?)?);
 let state = BpcAxumState::new(BpcVerifier::default(), authority, nonce_store);
 let app = Router::new().layer(middleware::from_fn_with_state(state, bpc_axum_middleware));
 # Ok::<(), bpc_protocol::BpcError>(())
@@ -200,8 +216,8 @@ Run the full gate locally after setting service URLs:
 
 ```bash
 export BPC_TEST_REDIS_URL='redis://127.0.0.1:6379/'
-# `live-integration` deliberately enables `postgres-insecure-tests`; do not use
-# this URL or feature set for an application build.
+# `live-integration` deliberately enables the test-only Redis and PostgreSQL
+# plaintext features; do not use these URLs or this feature set for an app build.
 export BPC_TEST_POSTGRES_URL='postgres://postgres:postgres@127.0.0.1:5432/postgres'
 cargo test --all-features --all-targets
 cargo fmt --check

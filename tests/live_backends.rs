@@ -1,4 +1,8 @@
-#![cfg(all(feature = "live-integration", feature = "postgres-insecure-tests"))]
+#![cfg(all(
+    feature = "live-integration",
+    feature = "postgres-insecure-tests",
+    feature = "redis-insecure-tests"
+))]
 
 use std::env;
 use std::thread;
@@ -29,7 +33,9 @@ fn governed_redis_fails_closed_then_detects_real_replay() {
     config.safety_buffer_ms = 5;
     config.continuity_allowance_ms = 5;
     config.command_timeout = Duration::from_secs(2);
-    let store = GovernedRedisNonceStore::connect(&url, config.clone()).unwrap();
+    // Plaintext is permitted only by the explicitly named test constructor,
+    // which pins localhost/loopback rather than trusting DNS or a remote URL.
+    let store = GovernedRedisNonceStore::connect_loopback_for_tests(&url, config.clone()).unwrap();
 
     // A fresh namespace is deliberately unusable until the full replay horizon
     // has elapsed. This proves startup does not accept a potentially restored keyspace.

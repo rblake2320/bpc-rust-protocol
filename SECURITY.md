@@ -32,6 +32,9 @@ BPC protects a server from unapproved pair use, request tampering, stale request
 ### Redis replay protection
 
 - Use the `GovernedRedisNonceStore`, not a bare `SET NX` implementation.
+- Use only `GovernedRedisNonceStore::connect_tls` or `connect_tls_with_config` in an application build. Both accept one `rediss://` TCP endpoint through Rustls; they reject plaintext/Unix/alternate or multi-host URLs and all URL fragments, including `#insecure`.
+- Do not enable Redis's insecure TLS-verification feature or bypass certificate/hostname verification. Use the Redis certificate's DNS SAN in `BPC_REDIS_URL`. For an internal/private CA or Redis mTLS, configure bounded root and paired client-key material through `RedisTlsConfig`; use `with_system_roots(false)` when a private CA must be the complete trust set.
+- Never enable `redis-insecure-tests` in an application build. Its deliberately named `connect_loopback_for_tests` constructor accepts only a pinned local plaintext address and exists solely for isolated integration tests.
 - Require Redis TLS, ACL authentication, dedicated tenancy/database, bounded client queues, and `maxmemory-policy noeviction`.
 - Allow the service principal to read `CONFIG GET maxmemory-policy` or provide an equivalent controlled preflight; failure to prove no-eviction must keep authorization closed.
 - Call `provision_epoch` and then `reconcile` before accepting traffic. New/mismatched epochs intentionally quarantine for the configured replay retention horizon.

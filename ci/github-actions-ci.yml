@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       redis:
-        image: redis:7-alpine
+        image: redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 # 7-alpine
         ports:
           - 6379:6379
         options: >-
@@ -23,7 +23,7 @@ jobs:
           --health-timeout 3s
           --health-retries 20
       postgres:
-        image: postgres:16-alpine
+        image: postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea # 16-alpine
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -40,20 +40,21 @@ jobs:
       BPC_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: 1.85.0
           components: rustfmt, clippy
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Assert replay-safe Redis policy
         run: test "$(redis-cli -h 127.0.0.1 CONFIG GET maxmemory-policy | tail -n 1)" = "noeviction"
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --check --all
       - name: Lint
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test all features including real services
-        run: cargo test --all-features --all-targets
+        run: cargo test --locked --all-features --all-targets
       - name: Verify Rust outputs with independent Node WebCrypto
         run: node scripts/verify-node-interop.mjs

@@ -96,7 +96,12 @@ pub use verifier::{BpcVerifier, BpcVerifierConfig};
 pub use axum::{BpcAxumState, auth_snapshot, bpc_axum_middleware};
 
 #[cfg(feature = "redis-store")]
-pub use redis_store::{GovernedRedisNonceConfig, GovernedRedisNonceStore};
+pub use redis_store::{
+    GovernedRedisNonceConfig, GovernedRedisNonceStore, MAX_REDIS_TLS_ADDITIONAL_ROOT_CERTIFICATES,
+    MAX_REDIS_TLS_CLIENT_CERTIFICATE_CHAIN_BYTES, MAX_REDIS_TLS_CLIENT_PRIVATE_KEY_BYTES,
+    MAX_REDIS_TLS_ROOT_CERTIFICATE_BYTES, MAX_REDIS_TLS_TOTAL_ROOT_CERTIFICATE_BYTES,
+    RedisTlsConfig,
+};
 
 #[cfg(feature = "postgres-store")]
 pub use postgres_store::{
