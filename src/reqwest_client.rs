@@ -1,5 +1,7 @@
 //! Reqwest transport for BPC-signed HTTPS requests.
 
+use std::time::Duration;
+
 use p256::ecdsa::SigningKey;
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method, Response, Url};
@@ -20,6 +22,40 @@ pub struct BpcHttpClient {
     signing_key: SigningKey,
 }
 
+/// Bounded transport deadlines. Tighten these values to the application SLA;
+/// none may be disabled because BPC credentials must not accumulate behind a
+/// stalled origin.
+#[derive(Clone, Debug)]
+pub struct BpcHttpClientConfig {
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub read_timeout: Duration,
+}
+
+impl Default for BpcHttpClientConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(10),
+            read_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+impl BpcHttpClientConfig {
+    fn validate(&self) -> Result<()> {
+        if self.connect_timeout.is_zero()
+            || self.request_timeout.is_zero()
+            || self.read_timeout.is_zero()
+        {
+            return Err(BpcError::InvalidPayload(
+                "BPC HTTP client timeouts must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl BpcHttpClient {
     /// Creates a transport pinned to one HTTPS origin.
     ///
@@ -33,6 +69,24 @@ impl BpcHttpClient {
         registration_secret: impl Into<String>,
         signing_key: SigningKey,
     ) -> Result<Self> {
+        Self::new_with_config(
+            base_url,
+            pair_id,
+            registration_secret,
+            signing_key,
+            BpcHttpClientConfig::default(),
+        )
+    }
+
+    /// Creates a pinned BPC transport with explicit bounded deadlines.
+    pub fn new_with_config(
+        base_url: Url,
+        pair_id: impl Into<String>,
+        registration_secret: impl Into<String>,
+        signing_key: SigningKey,
+        config: BpcHttpClientConfig,
+    ) -> Result<Self> {
+        config.validate()?;
         if base_url.scheme() != "https"
             && !matches!(
                 base_url.host_str(),
@@ -62,6 +116,9 @@ impl BpcHttpClient {
         crate::validate_secret(&registration_secret)?;
         let client = Client::builder()
             .redirect(Policy::none())
+            .connect_timeout(config.connect_timeout)
+            .timeout(config.request_timeout)
+            .read_timeout(config.read_timeout)
             .build()
             .map_err(|error| {
                 BpcError::PairRegistry(format!("HTTP client setup failed: {error}"))

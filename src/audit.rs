@@ -8,6 +8,9 @@ use crate::{BpcError, Result};
 
 /// Hash used as the predecessor of the first audit entry.
 pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+/// Upper bound for one in-process audit-chain verification. Older histories
+/// should be checked in bounded segments against independently anchored heads.
+pub const DEFAULT_AUDIT_VERIFY_MAX_ENTRIES: usize = 100_000;
 
 /// Security-relevant events recorded by the BPC audit chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,7 +209,20 @@ impl AuditLog for MemoryAuditLog {
     }
 
     fn verify(&self, expected_anchor: Option<&AuditHead>) -> Result<AuditVerification> {
-        verify_audit_entries(&self.entries()?, expected_anchor)
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| BpcError::PairRegistry("audit log lock poisoned".into()))?;
+        if state.entries.len() > DEFAULT_AUDIT_VERIFY_MAX_ENTRIES {
+            return Ok(AuditVerification {
+                valid: false,
+                broken_at_sequence: None,
+                reason: Some("verification_work_limit_exceeded"),
+            });
+        }
+        let entries = state.entries.clone();
+        drop(state);
+        verify_audit_entries(&entries, expected_anchor)
     }
 }
 
@@ -238,6 +254,13 @@ pub fn verify_audit_entries(
     entries: &[AuditEntry],
     expected_anchor: Option<&AuditHead>,
 ) -> Result<AuditVerification> {
+    if entries.len() > DEFAULT_AUDIT_VERIFY_MAX_ENTRIES {
+        return Ok(AuditVerification {
+            valid: false,
+            broken_at_sequence: None,
+            reason: Some("verification_work_limit_exceeded"),
+        });
+    }
     if entries.is_empty() {
         return Ok(match expected_anchor {
             Some(anchor)

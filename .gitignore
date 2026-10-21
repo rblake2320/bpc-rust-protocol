@@ -1,4 +1,9 @@
 /target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
+/security-artifacts/
+/Cargo.toml.orig
 .env
 .env.*
 !.env.example

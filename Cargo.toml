@@ -1,6 +1,6 @@
 [package]
 name = "bpc-protocol"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust implementation of the BPC (Bound Pair Credentials) v1 HTTP request protocol"
@@ -9,6 +9,7 @@ repository = "https://github.com/rblake2320/bpc-rust-protocol"
 readme = "README.md"
 keywords = ["authentication", "authorization", "ecdsa", "security", "protocol"]
 categories = ["authentication", "cryptography", "web-programming"]
+exclude = ["Cargo.toml.orig", "fuzz/**", "security-artifacts/**", "target/**"]
 
 [features]
 default = []
@@ -23,6 +24,7 @@ live-integration = ["redis-store", "postgres-store"]
 aes-gcm = { version = "0.10.3", optional = true }
 axum = { version = "0.8.8", optional = true }
 base64 = "0.22.1"
+getrandom = { version = "0.2.17", features = ["js"] }
 http = { version = "1.4.0", optional = true }
 hkdf = "0.12.4"
 hmac = "0.12.1"
@@ -37,13 +39,15 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 thiserror = "2.0.17"
-tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "sync"], optional = true }
+tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"], optional = true }
 tokio-rustls = { version = "0.26.1", optional = true }
-uuid = { version = "1.18.1", features = ["v4", "serde"] }
+uuid = { version = "1.18.1", features = ["v4", "serde", "js"] }
 url = { version = "2.5.7", optional = true }
 zeroize = { version = "1.8.2", optional = true }
 
 [dev-dependencies]
+futures-util = "0.3.31"
+proptest = "1.10.0"
 serde_json = "1.0.145"
-tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tower = { version = "0.5.3", features = ["util"] }

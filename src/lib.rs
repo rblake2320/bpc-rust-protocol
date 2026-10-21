@@ -27,11 +27,12 @@
 //! let registry = MemoryPairRegistry::default();
 //! registry.insert(PairRecord {
 //!     id: pair_id.into(), name: "example".into(), scope: Scope::ReadWrite,
-//!     mode: PairMode::Development, request_hmac_key: derive_request_hmac_key(secret)?,
+//!     mode: PairMode::Development, audience: "bpc://localhost/development".into(),
+//!     request_hmac_key: derive_request_hmac_key(secret)?,
 //!     public_jwk: key_pair.public_jwk().clone(), status: PairStatus::Active,
 //!     created_at_ms: 1_700_000_000_000, expires_at_ms: None, max_requests: None,
 //!     requests: 0, failed_signatures: 0, authorization_version: 1,
-//!     kind: bpc_protocol::PairKind::Legitimate, canary_class: None,
+//!     kind: bpc_protocol::PairKind::Legitimate, canary_class: None, replaced_by: None,
 //! })?;
 //! let (_payload, headers) = sign_request_at(
 //!     key_pair.signing_key(), pair_id, secret, "POST", "/v1/widgets", b"{}",
@@ -66,7 +67,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use audit::{
     AuditAction, AuditEntry, AuditEvent, AuditHead, AuditLog, AuditSeverity, AuditVerification,
-    GENESIS_HASH, MemoryAuditLog, audit_hash, verify_audit_entries,
+    DEFAULT_AUDIT_VERIFY_MAX_ENTRIES, GENESIS_HASH, MemoryAuditLog, audit_hash,
+    verify_audit_entries,
 };
 pub use authority::{
     MemoryPairAuthority, PairAuthority, PairRegistration, PendingPairing, RedactedPair,
@@ -78,18 +80,19 @@ pub use canonical::{
 pub use client::{sign_request, sign_request_at};
 pub use crypto::{
     b64url_decode, b64url_encode, body_hash, compute_fingerprint, derive_request_hmac_key,
-    generate_registration_secret, request_hmac, sign_payload, sign_rotation_payload,
+    generate_registration_secret, request_hmac, rotation_hmac, sign_payload, sign_rotation_payload,
     validate_secret, verify_payload, verify_payload_bytes, verify_request_hmac,
-    verify_rotation_payload,
+    verify_rotation_hmac, verify_rotation_payload,
 };
 pub use error::{BpcError, Result};
 pub use types::{
     AuthSnapshot, BPC_PROTOCOL_VERSION, BpcKeyPair, BpcPayload, BpcRequest, CanaryClass,
-    MAX_JS_SAFE_INTEGER, MemoryNonceStore, MemoryPairRegistry, NonceStore, PairKind, PairMode,
-    PairRecord, PairRegistry, PairStatus, PublicJwk, Scope, SignedHeaders, SuccessClaim,
-    VerificationError, VerificationResult, is_valid_pair_id,
+    MAX_AUDIENCE_LEN, MAX_JS_SAFE_INTEGER, MemoryNonceStore, MemoryPairRegistry, NonceStore,
+    PairKind, PairMode, PairRecord, PairRegistry, PairStatus, PublicJwk, Scope, SignedHeaders,
+    SuccessClaim, VerificationError, VerificationResult, is_valid_audience, is_valid_pair_id,
+    validate_request_hmac_key,
 };
-pub use verifier::{BpcVerifier, BpcVerifierConfig};
+pub use verifier::{BpcVerifier, BpcVerifierConfig, MAX_SIGNATURE_WINDOW_MS};
 
 #[cfg(feature = "axum")]
 pub use axum::{BpcAxumState, BpcPublicErrorDisclosure, auth_snapshot, bpc_axum_middleware};
@@ -104,7 +107,7 @@ pub use postgres_store::{
 };
 
 #[cfg(feature = "reqwest-client")]
-pub use reqwest_client::BpcHttpClient;
+pub use reqwest_client::{BpcHttpClient, BpcHttpClientConfig};
 
 /// Returns the current Unix timestamp in milliseconds.
 pub fn unix_ms() -> Result<u64> {

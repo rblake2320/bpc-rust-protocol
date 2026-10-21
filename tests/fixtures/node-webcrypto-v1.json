@@ -5,8 +5,8 @@
   "public_jwk": {
     "kty": "EC",
     "crv": "P-256",
-    "x": "WovlWJL6NSEleg0iCNjNPM_sp_IqyG_xhvxP3Jlgh2Q",
-    "y": "6jyqPvtTZzdk5N8QH-RY9e1sBKAKqYoSIQ7t0q1p-0Y",
+    "x": "tzmSEExehzxV69GWLRSPqJlnetI_OWu8JciPFuJd6WU",
+    "y": "VYFYh_rz-86ibnLKKfLO6RFyxYD5tX481aDSMUPH6XI",
     "key_ops": [
       "verify"
     ],
@@ -25,7 +25,7 @@
   },
   "headers": {
     "pair_id": "pair_nodeinterop",
-    "signature": "sdQAAdIZE2OqMa2Zj_EwhCbJIpfwsUW7V9L75dnKUFUI_z6PgQ-qcNRdHql-ozMVR24TDKXFgmScXnrP4vZLag",
+    "signature": "MIecA71sj_OYWBgoUClYIB9QZTKF2SwjvZ4AkDfChKJAisSf0VCb33oCkqbUXXvCIzZHZbkbxmN2ROqNqqHRdg",
     "signed_data": "eyJib2R5X2hhc2giOiJzaGEyNTY6b3lsUk0zQjAzNUlXWGNXLXNMN2ZseWhySFZCcWR2N1kyM3d1bEMwM2tlcyIsIm1ldGhvZCI6IlBPU1QiLCJub25jZSI6IjEyM2U0NTY3LWU4OWItNDJkMy1hNDU2LTQyNjYxNDE3NDAwMCIsInBhaXJfaWQiOiJwYWlyX25vZGVpbnRlcm9wIiwicGF0aCI6Ii92MS93aWRnZXRzP3NvdXJjZT1ub2RlIiwic2VjcmV0X2htYWMiOiJOQVJLRXRGQlo2OGZTeXZRVEplRDYtc2pkS0pHNGozVHl3bWYzN2ZVYXNnIiwidGltZXN0YW1wIjoxNzQwMDAwMDAwMDAwLCJ2ZXJzaW9uIjoiMS4wIn0",
     "version": "1.0"
   }

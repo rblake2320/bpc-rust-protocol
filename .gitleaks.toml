@@ -1,0 +1,10 @@
+title = "BPC Rust secret-scanning policy"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Fixed public interoperability vector: derived HMAC, signature, and encoded public request only"
+paths = [
+  '''(^|/)tests/fixtures/node-webcrypto-v1\.json$''',
+]

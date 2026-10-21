@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    BpcError, CanaryClass, MAX_JS_SAFE_INTEGER, PairKind, PairMode, PairRecord, PairRegistry,
-    PairStatus, PublicJwk, Result, Scope, SuccessClaim, b64url_decode, b64url_encode,
-    is_valid_pair_id, sign_rotation_payload, verify_rotation_payload,
+    BpcError, CanaryClass, MAX_JS_SAFE_INTEGER, MAX_SIGNATURE_WINDOW_MS, PairKind, PairMode,
+    PairRecord, PairRegistry, PairStatus, PublicJwk, Result, Scope, SuccessClaim, b64url_encode,
+    is_valid_audience, is_valid_pair_id, rotation_hmac, sign_rotation_payload,
+    validate_request_hmac_key, verify_rotation_hmac, verify_rotation_payload,
 };
 
 /// Data submitted for a BPC pairing request. It intentionally contains only public material.
@@ -20,6 +21,9 @@ pub struct PairRegistration {
     pub name: String,
     pub scope: Scope,
     pub mode: PairMode,
+    /// Locally configured trust domain for this credential, such as
+    /// `bpc://api.example.test/tenant-a/production`.
+    pub audience: String,
     /// 32-byte HKDF-derived request HMAC key encoded as unpadded base64url.
     pub request_hmac_key: String,
     pub public_jwk: PublicJwk,
@@ -32,7 +36,10 @@ pub struct PairRegistration {
 
 impl PairRegistration {
     pub fn validate(&self) -> Result<()> {
-        if self.name.is_empty() || self.name.chars().count() > 128 {
+        if self.name.is_empty()
+            || self.name.chars().count() > 128
+            || !is_valid_audience(&self.audience)
+        {
             return Err(BpcError::PairRegistry(
                 "registration name must contain 1 to 128 characters".into(),
             ));
@@ -49,13 +56,7 @@ impl PairRegistration {
             ));
         }
         self.public_jwk.to_verifying_key()?;
-        let key = b64url_decode(&self.request_hmac_key)
-            .map_err(|_| BpcError::PairRegistry("request HMAC key is not base64url".into()))?;
-        if self.request_hmac_key.len() != 43 || key.len() != 32 {
-            return Err(BpcError::PairRegistry(
-                "request HMAC key must be a full 32-byte base64url value".into(),
-            ));
-        }
+        validate_request_hmac_key(&self.request_hmac_key)?;
         if matches!(self.kind, PairKind::Ghost) != self.canary_class.is_some() {
             return Err(BpcError::PairRegistry(
                 "ghost registrations require a canary class and legitimate registrations cannot have one".into(),
@@ -80,6 +81,7 @@ pub struct RedactedPair {
     pub name: String,
     pub scope: Scope,
     pub mode: PairMode,
+    pub audience: String,
     pub status: PairStatus,
     pub created_at_ms: u64,
     pub requests: u64,
@@ -146,7 +148,7 @@ impl PairAuthority for MemoryPairAuthority {
                 "approval timestamp must be a JavaScript-safe integer".into(),
             ));
         }
-        if self.registry.active_count()? >= self.max_active_pairs {
+        if self.registry.expire_due_and_active_count(now_ms)? >= self.max_active_pairs {
             return Err(BpcError::PairRegistry(format!(
                 "maximum pair capacity ({}) reached",
                 self.max_active_pairs
@@ -169,6 +171,11 @@ impl PairAuthority for MemoryPairAuthority {
     }
 
     fn approve_pairing(&self, token: &str, now_ms: u64) -> Result<String> {
+        if now_ms > MAX_JS_SAFE_INTEGER {
+            return Err(BpcError::PairRegistry(
+                "approval timestamp must be a JavaScript-safe integer".into(),
+            ));
+        }
         let pending_pairing = {
             let mut pending = self
                 .pending
@@ -178,7 +185,16 @@ impl PairAuthority for MemoryPairAuthority {
                 BpcError::PairRegistry("pending approval token was not found".into())
             })?
         };
-        if self.registry.active_count()? >= self.max_active_pairs {
+        if pending_pairing
+            .registration
+            .expires_at_ms
+            .is_some_and(|expires_at| now_ms > expires_at)
+        {
+            return Err(BpcError::PairRegistry(
+                "pair registration has already expired".into(),
+            ));
+        }
+        if self.registry.expire_due_and_active_count(now_ms)? >= self.max_active_pairs {
             // This development implementation fails closed: the request remains unapproved.
             let mut pending = self
                 .pending
@@ -191,33 +207,42 @@ impl PairAuthority for MemoryPairAuthority {
             )));
         }
         let id = format!("pair_{}", Uuid::new_v4().simple());
+        let registration = pending_pairing.registration.clone();
         let pair = PairRecord {
             id: id.clone(),
-            name: pending_pairing.registration.name,
-            scope: pending_pairing.registration.scope,
-            mode: pending_pairing.registration.mode,
-            request_hmac_key: pending_pairing.registration.request_hmac_key,
-            public_jwk: pending_pairing.registration.public_jwk,
+            name: registration.name,
+            scope: registration.scope,
+            mode: registration.mode,
+            audience: registration.audience,
+            request_hmac_key: registration.request_hmac_key,
+            public_jwk: registration.public_jwk,
             status: PairStatus::Active,
             created_at_ms: now_ms,
-            expires_at_ms: pending_pairing.registration.expires_at_ms,
-            max_requests: pending_pairing.registration.max_requests,
+            expires_at_ms: registration.expires_at_ms,
+            max_requests: registration.max_requests,
             requests: 0,
             failed_signatures: 0,
             authorization_version: 1,
-            kind: pending_pairing.registration.kind,
-            canary_class: pending_pairing.registration.canary_class,
+            kind: registration.kind,
+            canary_class: registration.canary_class,
+            replaced_by: None,
         };
-        self.registry.insert(pair)?;
+        if let Err(error) =
+            self.registry
+                .insert_approved_if_capacity(pair, self.max_active_pairs, now_ms)
+        {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| BpcError::PairRegistry("pending registry lock poisoned".into()))?;
+            pending.insert(token.to_owned(), pending_pairing);
+            return Err(error);
+        }
         Ok(id)
     }
 
     fn revoke(&self, pair_id: &str) -> Result<bool> {
-        if self.registry.get(pair_id)?.is_none() {
-            return Ok(false);
-        }
-        self.registry.update_status(pair_id, PairStatus::Revoked)?;
-        Ok(true)
+        self.registry.revoke_lineage(pair_id)
     }
 
     fn rotate_pair(&self, expected_old: &PairRecord, replacement: PairRecord) -> Result<bool> {
@@ -234,6 +259,7 @@ impl PairAuthority for MemoryPairAuthority {
                 name: pair.name,
                 scope: pair.scope,
                 mode: pair.mode,
+                audience: pair.audience,
                 status: pair.status,
                 created_at_ms: pair.created_at_ms,
                 requests: pair.requests,
@@ -247,6 +273,7 @@ impl PairAuthority for MemoryPairAuthority {
 #[serde(deny_unknown_fields)]
 pub struct RotationPayload {
     pub new_pub_jwk_json: String,
+    pub nonce: String,
     pub old_pair_id: String,
     pub purpose: String,
     pub timestamp: u64,
@@ -258,6 +285,8 @@ pub struct RotationPayload {
 pub struct RotationRequest {
     pub old_pair_id: String,
     pub new_public_jwk: PublicJwk,
+    pub nonce: String,
+    pub secret_hmac: String,
     pub signature: String,
     pub signed_data: String,
     pub timestamp: u64,
@@ -266,8 +295,10 @@ pub struct RotationRequest {
 /// Builds a signed, canonically encoded key rotation request.
 pub fn sign_rotation_at(
     signing_key: &SigningKey,
+    registration_secret: &str,
     old_pair_id: &str,
     new_public_jwk: &PublicJwk,
+    nonce: Uuid,
     timestamp_ms: u64,
 ) -> Result<RotationRequest> {
     if !is_valid_pair_id(old_pair_id) {
@@ -277,15 +308,20 @@ pub fn sign_rotation_at(
     let new_pub_jwk_json = serde_json::to_string(new_public_jwk)?;
     let payload = RotationPayload {
         new_pub_jwk_json,
+        nonce: nonce.to_string(),
         old_pair_id: old_pair_id.to_owned(),
         purpose: "rotation".into(),
         timestamp: timestamp_ms,
     };
     let canonical = canonical_rotation_bytes(&payload)?;
     let signature = sign_rotation_payload(signing_key, &payload)?;
+    let request_hmac_key = crate::derive_request_hmac_key(registration_secret)?;
+    let secret_hmac = rotation_hmac(&request_hmac_key, &canonical)?;
     Ok(RotationRequest {
         old_pair_id: old_pair_id.to_owned(),
         new_public_jwk: new_public_jwk.clone(),
+        nonce: payload.nonce,
+        secret_hmac,
         signature,
         signed_data: b64url_encode(canonical),
         timestamp: timestamp_ms,
@@ -302,6 +338,9 @@ pub fn verify_and_rotate_at<A: PairAuthority>(
     if !is_valid_pair_id(&request.old_pair_id)
         || request.signed_data.len() > 4096
         || request.signature.len() > 256
+        || request.secret_hmac.len() != 43
+        || signature_window_ms == 0
+        || signature_window_ms > MAX_SIGNATURE_WINDOW_MS
         || now_ms.abs_diff(request.timestamp) > signature_window_ms
     {
         return Err(BpcError::InvalidPayload(
@@ -316,6 +355,18 @@ pub fn verify_and_rotate_at<A: PairAuthority>(
         return Err(BpcError::PairRegistry("old pair is not active".into()));
     }
     let (payload, canonical) = parse_canonical_rotation(&request.signed_data)?;
+    let rotation_nonce = Uuid::parse_str(&payload.nonce)
+        .map_err(|_| BpcError::InvalidPayload("rotation nonce is invalid".into()))?;
+    if rotation_nonce.get_version() != Some(uuid::Version::Random)
+        || rotation_nonce.get_variant() != uuid::Variant::RFC4122
+    {
+        return Err(BpcError::InvalidPayload(
+            "rotation nonce must be UUID v4".into(),
+        ));
+    }
+    if !verify_rotation_hmac(&old_pair.request_hmac_key, &canonical, &request.secret_hmac) {
+        return Err(BpcError::InvalidHmacKey);
+    }
     if !verify_rotation_payload(
         &old_pair.public_jwk.to_verifying_key()?,
         &canonical,
@@ -325,6 +376,7 @@ pub fn verify_and_rotate_at<A: PairAuthority>(
     }
     if payload.purpose != "rotation"
         || payload.old_pair_id != request.old_pair_id
+        || payload.nonce != request.nonce
         || payload.timestamp != request.timestamp
     {
         return Err(BpcError::InvalidPayload(
@@ -339,12 +391,21 @@ pub fn verify_and_rotate_at<A: PairAuthority>(
             "rotation JWK is not bound to its request".into(),
         ));
     }
+    if old_pair
+        .public_jwk
+        .same_key_material(&request.new_public_jwk)
+    {
+        return Err(BpcError::InvalidPayload(
+            "rotation replacement key must differ from the old key".into(),
+        ));
+    }
     let new_pair_id = format!("pair_{}", Uuid::new_v4().simple());
     let replacement = PairRecord {
         id: new_pair_id.clone(),
         name: old_pair.name.clone(),
         scope: old_pair.scope,
         mode: old_pair.mode,
+        audience: old_pair.audience.clone(),
         request_hmac_key: old_pair.request_hmac_key.clone(),
         public_jwk: request.new_public_jwk.clone(),
         status: PairStatus::Active,
@@ -356,6 +417,7 @@ pub fn verify_and_rotate_at<A: PairAuthority>(
         authorization_version: 1,
         kind: old_pair.kind,
         canary_class: old_pair.canary_class,
+        replaced_by: None,
     };
     if !authority.rotate_pair(&old_pair, replacement)? {
         return Err(BpcError::PairRegistry(
@@ -387,10 +449,16 @@ pub(crate) fn parse_canonical_rotation(signed_data: &str) -> Result<(RotationPay
     let object = value
         .as_object()
         .ok_or_else(|| BpcError::InvalidPayload("rotation payload must be an object".into()))?;
-    const KEYS: [&str; 4] = ["new_pub_jwk_json", "old_pair_id", "purpose", "timestamp"];
+    const KEYS: [&str; 5] = [
+        "new_pub_jwk_json",
+        "nonce",
+        "old_pair_id",
+        "purpose",
+        "timestamp",
+    ];
     if object.len() != KEYS.len() || KEYS.iter().any(|key| !object.contains_key(*key)) {
         return Err(BpcError::InvalidPayload(
-            "rotation payload must contain exactly four fields".into(),
+            "rotation payload must contain exactly five fields".into(),
         ));
     }
     if object
@@ -402,7 +470,10 @@ pub(crate) fn parse_canonical_rotation(signed_data: &str) -> Result<(RotationPay
         ));
     }
     let payload: RotationPayload = serde_json::from_value(value)?;
-    if payload.new_pub_jwk_json.is_empty() || !is_valid_pair_id(&payload.old_pair_id) {
+    if payload.new_pub_jwk_json.is_empty()
+        || !is_valid_pair_id(&payload.old_pair_id)
+        || Uuid::parse_str(&payload.nonce).is_err()
+    {
         return Err(BpcError::InvalidPayload(
             "rotation payload fields are invalid".into(),
         ));

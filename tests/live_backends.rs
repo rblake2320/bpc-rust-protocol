@@ -28,6 +28,7 @@ fn governed_redis_fails_closed_then_detects_real_replay() {
     let namespace = format!("bpcitest{}", Uuid::new_v4().simple());
     let mut config = GovernedRedisNonceConfig::new(namespace, "epoch-v1", 25).unwrap();
     config.allow_insecure_loopback = true;
+    config.min_replica_acks = 0;
     config.safety_buffer_ms = 5;
     config.continuity_allowance_ms = 5;
     config.command_timeout = Duration::from_secs(2);
@@ -39,14 +40,15 @@ fn governed_redis_fails_closed_then_detects_real_replay() {
     thread::sleep(Duration::from_millis(config.quarantine_ms().unwrap() + 20));
     store.reconcile().unwrap();
     let ttl = store.retention_ms().unwrap();
+    let now = bpc_protocol::unix_ms().unwrap();
     assert!(
         !store
-            .check_and_consume("nonce-live-redis-1", 1_740_000_000_000, ttl)
+            .check_and_consume("pair_live_redis", "nonce-live-redis-1", now, now, ttl)
             .unwrap()
     );
     assert!(
         store
-            .check_and_consume("nonce-live-redis-1", 1_740_000_000_000, ttl)
+            .check_and_consume("pair_live_redis", "nonce-live-redis-1", now, now, ttl)
             .unwrap()
     );
 }
@@ -69,6 +71,7 @@ fn postgres_authority_and_audit_are_real_transactional_backends() {
                 approval_ttl_ms: 60_000,
                 schema: schema.clone(),
                 secret_protector: PostgresSecretProtector::new("test-key-v1", [7; 32])?,
+                require_synchronous_replication: false,
             },
         )?;
         authority.migrate()?;
@@ -77,6 +80,7 @@ fn postgres_authority_and_audit_are_real_transactional_backends() {
             name: "live-postgres".into(),
             scope: Scope::Admin,
             mode: PairMode::Production,
+            audience: "bpc://live-postgres/production".into(),
             request_hmac_key: derive_request_hmac_key("LivePostgresSecret9!@")?,
             public_jwk: old_key.public_jwk().clone(),
             expires_at_ms: None,
@@ -111,6 +115,7 @@ fn postgres_authority_and_audit_are_real_transactional_backends() {
             name: "rotation-live".into(),
             scope: Scope::ReadWrite,
             mode: PairMode::Production,
+            audience: "bpc://live-postgres/production".into(),
             request_hmac_key: derive_request_hmac_key("LiveRotationSecret9!@")?,
             public_jwk: rotate_key.public_jwk().clone(),
             expires_at_ms: None,
@@ -123,8 +128,10 @@ fn postgres_authority_and_audit_are_real_transactional_backends() {
         let replacement_key = BpcKeyPair::generate()?;
         let rotation = sign_rotation_at(
             rotate_key.signing_key(),
+            "LiveRotationSecret9!@",
             &old_id,
             replacement_key.public_jwk(),
+            Uuid::new_v4(),
             now,
         )?;
         let replacement_id = verify_and_rotate_at(&authority, &rotation, now, 60_000)?;

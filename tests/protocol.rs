@@ -6,9 +6,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bpc_protocol::{
     AuditAction, AuditEvent, AuditHead, AuditLog, AuditSeverity, BpcError, BpcKeyPair, BpcRequest,
     BpcVerifier, BpcVerifierConfig, CanaryClass, MemoryAuditLog, MemoryNonceStore,
-    MemoryPairAuthority, MemoryPairRegistry, PairKind, PairMode, PairRecord, PairRegistry,
-    PairStatus, Scope, VerificationError, derive_request_hmac_key, generate_registration_secret,
-    sign_request_at, sign_rotation_at, validate_secret, verify_and_rotate_at,
+    MemoryPairAuthority, MemoryPairRegistry, PairAuthority, PairKind, PairMode, PairRecord,
+    PairRegistration, PairRegistry, PairStatus, Scope, VerificationError, derive_request_hmac_key,
+    generate_registration_secret, sign_request_at, sign_rotation_at, validate_secret,
+    verify_and_rotate_at,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -26,6 +27,7 @@ fn setup(kind: PairKind) -> (Arc<MemoryPairRegistry>, BpcKeyPair, MemoryNonceSto
             name: "protocol-test".into(),
             scope: Scope::Admin,
             mode: PairMode::Development,
+            audience: "bpc://localhost/development".into(),
             request_hmac_key: derive_request_hmac_key(SECRET).unwrap(),
             public_jwk: keypair.public_jwk().clone(),
             status: PairStatus::Active,
@@ -37,6 +39,7 @@ fn setup(kind: PairKind) -> (Arc<MemoryPairRegistry>, BpcKeyPair, MemoryNonceSto
             authorization_version: 1,
             kind,
             canary_class: matches!(kind, PairKind::Ghost).then_some(CanaryClass::Docs),
+            replaced_by: None,
         })
         .unwrap();
     (registry, keypair, MemoryNonceStore::default())
@@ -78,6 +81,135 @@ fn signs_and_verifies_exact_body_and_path() {
     );
     assert!(result.ok, "{result:?}");
     assert_eq!(result.snapshot.unwrap().scope, Scope::Admin);
+}
+
+#[test]
+fn verifier_rejects_untrusted_audience_and_out_of_policy_freshness_windows() {
+    let (registry, keypair, nonces) = setup(PairKind::Legitimate);
+    let (body, headers) = signed_request(&keypair);
+    let production = BpcVerifier::new(
+        BpcVerifierConfig::new("bpc://api.example.test/production", PairMode::Production).unwrap(),
+    );
+    let denied = production.verify_at(
+        BpcRequest {
+            pair_id: &headers.pair_id,
+            signature: &headers.signature,
+            signed_data: &headers.signed_data,
+            version: &headers.version,
+            method: "POST",
+            path: "/v1/widgets?from=test",
+            body: &body,
+        },
+        registry.as_ref(),
+        &nonces,
+        NOW,
+    );
+    assert_eq!(denied.error, Some(VerificationError::AudienceMismatch));
+    assert!(
+        BpcVerifierConfig::new("bpc://localhost/development", PairMode::Development)
+            .unwrap()
+            .with_signature_window_ms(bpc_protocol::MAX_SIGNATURE_WINDOW_MS + 1)
+            .is_err()
+    );
+    assert!(
+        BpcVerifierConfig::new("bpc://localhost/development", PairMode::Development)
+            .unwrap()
+            .with_signature_window_ms(0)
+            .is_err()
+    );
+}
+
+#[test]
+fn nonce_identity_is_scoped_to_pair_but_still_rejects_each_pairs_replay() {
+    let (registry, first_key, nonces) = setup(PairKind::Legitimate);
+    let second_key = BpcKeyPair::generate().unwrap();
+    registry
+        .insert(PairRecord {
+            id: "pair_second".into(),
+            name: "second".into(),
+            scope: Scope::Admin,
+            mode: PairMode::Development,
+            audience: "bpc://localhost/development".into(),
+            request_hmac_key: derive_request_hmac_key("SecondProtocolSecret9!@#").unwrap(),
+            public_jwk: second_key.public_jwk().clone(),
+            status: PairStatus::Active,
+            created_at_ms: NOW,
+            expires_at_ms: None,
+            max_requests: None,
+            requests: 0,
+            failed_signatures: 0,
+            authorization_version: 1,
+            kind: PairKind::Legitimate,
+            canary_class: None,
+            replaced_by: None,
+        })
+        .unwrap();
+    let nonce = Uuid::parse_str("a8098c1a-f86e-4aef-9f0f-80e4b6c6c6c6").unwrap();
+    let body = br#"{"widget":"bpc"}"#;
+    let (_, first) = sign_request_at(
+        first_key.signing_key(),
+        PAIR_ID,
+        SECRET,
+        "POST",
+        "/v1/widgets?from=test",
+        body,
+        nonce,
+        NOW,
+    )
+    .unwrap();
+    let (_, second) = sign_request_at(
+        second_key.signing_key(),
+        "pair_second",
+        "SecondProtocolSecret9!@#",
+        "POST",
+        "/v1/widgets?from=test",
+        body,
+        nonce,
+        NOW,
+    )
+    .unwrap();
+    let verifier = BpcVerifier::default();
+    for headers in [&first, &second] {
+        assert!(
+            verifier
+                .verify_at(
+                    BpcRequest {
+                        pair_id: &headers.pair_id,
+                        signature: &headers.signature,
+                        signed_data: &headers.signed_data,
+                        version: &headers.version,
+                        method: "POST",
+                        path: "/v1/widgets?from=test",
+                        body,
+                    },
+                    registry.as_ref(),
+                    &nonces,
+                    NOW,
+                )
+                .ok
+        );
+    }
+    for headers in [&first, &second] {
+        assert_eq!(
+            verifier
+                .verify_at(
+                    BpcRequest {
+                        pair_id: &headers.pair_id,
+                        signature: &headers.signature,
+                        signed_data: &headers.signed_data,
+                        version: &headers.version,
+                        method: "POST",
+                        path: "/v1/widgets?from=test",
+                        body,
+                    },
+                    registry.as_ref(),
+                    &nonces,
+                    NOW,
+                )
+                .error,
+            Some(VerificationError::ReplayDetected)
+        );
+    }
 }
 
 #[test]
@@ -155,10 +287,7 @@ fn a_forged_signature_does_not_burn_the_nonce() {
 #[test]
 fn pair_id_only_junk_cannot_lock_a_credential() {
     let (registry, _keypair, nonces) = setup(PairKind::Legitimate);
-    let verifier = BpcVerifier::new(BpcVerifierConfig {
-        signature_window_ms: 60_000,
-        lockout_after: 2,
-    });
+    let verifier = BpcVerifier::default();
     for _ in 0..20 {
         let denied = verifier.verify_at(
             BpcRequest {
@@ -182,13 +311,10 @@ fn pair_id_only_junk_cannot_lock_a_credential() {
 }
 
 #[test]
-fn only_proven_secret_factor_failures_count_toward_lockout() {
+fn replayed_valid_hmac_with_invalid_signatures_cannot_lock_a_credential() {
     let (registry, keypair, nonces) = setup(PairKind::Legitimate);
     let (body, headers) = signed_request(&keypair);
-    let verifier = BpcVerifier::new(BpcVerifierConfig {
-        signature_window_ms: 60_000,
-        lockout_after: 2,
-    });
+    let verifier = BpcVerifier::default();
     let mut forged = headers.clone();
     forged.signature.push('A');
     for _ in 0..2 {
@@ -208,20 +334,16 @@ fn only_proven_secret_factor_failures_count_toward_lockout() {
         );
         assert_eq!(denied.error, Some(VerificationError::InvalidSignature));
     }
-    assert_eq!(
-        registry.get(PAIR_ID).unwrap().unwrap().status,
-        PairStatus::Locked
-    );
+    let pair = registry.get(PAIR_ID).unwrap().unwrap();
+    assert_eq!(pair.status, PairStatus::Active);
+    assert_eq!(pair.failed_signatures, 0);
 }
 
 #[test]
-fn zero_lockout_threshold_disables_credential_lockout_consistently() {
+fn all_invalid_signatures_leave_credential_state_unchanged() {
     let (registry, keypair, nonces) = setup(PairKind::Legitimate);
     let (body, headers) = signed_request(&keypair);
-    let verifier = BpcVerifier::new(BpcVerifierConfig {
-        signature_window_ms: 60_000,
-        lockout_after: 0,
-    });
+    let verifier = BpcVerifier::default();
     let mut forged = headers.clone();
     forged.signature.push('A');
     for _ in 0..3 {
@@ -336,8 +458,22 @@ fn rotation_is_signed_bound_and_atomic() {
     let (registry, old_key, _) = setup(PairKind::Legitimate);
     let authority = MemoryPairAuthority::new(Arc::clone(&registry), 10).unwrap();
     let new_key = BpcKeyPair::generate().unwrap();
-    let request =
-        sign_rotation_at(old_key.signing_key(), PAIR_ID, new_key.public_jwk(), NOW).unwrap();
+    let request = sign_rotation_at(
+        old_key.signing_key(),
+        SECRET,
+        PAIR_ID,
+        new_key.public_jwk(),
+        Uuid::parse_str("03d8cf96-ab7c-4727-b4e1-6a9309efb312").unwrap(),
+        NOW,
+    )
+    .unwrap();
+    let mut signature_only = request.clone();
+    signature_only.secret_hmac.replace_range(0..1, "A");
+    assert!(verify_and_rotate_at(&authority, &signature_only, NOW, 60_000).is_err());
+    assert_eq!(
+        registry.get(PAIR_ID).unwrap().unwrap().status,
+        PairStatus::Active
+    );
     let replacement_id = verify_and_rotate_at(&authority, &request, NOW, 60_000).unwrap();
     assert_eq!(
         registry.get(PAIR_ID).unwrap().unwrap().status,
@@ -347,6 +483,11 @@ fn rotation_is_signed_bound_and_atomic() {
     assert_eq!(replacement.status, PairStatus::Active);
     assert_eq!(replacement.public_jwk, *new_key.public_jwk());
     assert!(verify_and_rotate_at(&authority, &request, NOW, 60_000).is_err());
+    assert!(authority.revoke(PAIR_ID).unwrap());
+    assert_eq!(
+        registry.get(&replacement_id).unwrap().unwrap().status,
+        PairStatus::Revoked
+    );
 }
 
 #[test]
@@ -424,6 +565,7 @@ fn accepts_node_webcrypto_p1363_request_fixture() {
             name: "node-webcrypto".into(),
             scope: Scope::ReadWrite,
             mode: PairMode::Production,
+            audience: "bpc://api.example.test/production".into(),
             request_hmac_key: fixture.request_hmac_key,
             public_jwk: fixture.public_jwk,
             status: PairStatus::Active,
@@ -435,9 +577,13 @@ fn accepts_node_webcrypto_p1363_request_fixture() {
             authorization_version: 1,
             kind: PairKind::Legitimate,
             canary_class: None,
+            replaced_by: None,
         })
         .unwrap();
-    let result = BpcVerifier::default().verify_at(
+    let verifier = BpcVerifier::new(
+        BpcVerifierConfig::new("bpc://api.example.test/production", PairMode::Production).unwrap(),
+    );
+    let result = verifier.verify_at(
         BpcRequest {
             pair_id: &fixture.headers.pair_id,
             signature: &fixture.headers.signature,
@@ -452,4 +598,48 @@ fn accepts_node_webcrypto_p1363_request_fixture() {
         NOW,
     );
     assert!(result.ok, "{result:?}");
+}
+
+#[test]
+fn expired_pairs_are_transitioned_before_memory_capacity_is_checked() {
+    let registry = Arc::new(MemoryPairRegistry::default());
+    let authority = MemoryPairAuthority::new(Arc::clone(&registry), 1).unwrap();
+    let first_key = BpcKeyPair::generate().unwrap();
+    let first = PairRegistration {
+        name: "first".into(),
+        scope: Scope::Read,
+        mode: PairMode::Development,
+        audience: "bpc://localhost/development".into(),
+        request_hmac_key: derive_request_hmac_key(SECRET).unwrap(),
+        public_jwk: first_key.public_jwk().clone(),
+        expires_at_ms: Some(NOW),
+        max_requests: None,
+        kind: PairKind::Legitimate,
+        canary_class: None,
+    };
+    let first_token = authority.request_pairing(first, NOW).unwrap();
+    let first_id = authority.approve_pairing(&first_token, NOW).unwrap();
+    let second_key = BpcKeyPair::generate().unwrap();
+    let second = PairRegistration {
+        name: "second".into(),
+        scope: Scope::Read,
+        mode: PairMode::Development,
+        audience: "bpc://localhost/development".into(),
+        request_hmac_key: derive_request_hmac_key("SecondCapacitySecret9!@#").unwrap(),
+        public_jwk: second_key.public_jwk().clone(),
+        expires_at_ms: None,
+        max_requests: None,
+        kind: PairKind::Legitimate,
+        canary_class: None,
+    };
+    let second_token = authority.request_pairing(second, NOW + 1).unwrap();
+    let second_id = authority.approve_pairing(&second_token, NOW + 1).unwrap();
+    assert_eq!(
+        registry.get(&first_id).unwrap().unwrap().status,
+        PairStatus::Expired
+    );
+    assert_eq!(
+        registry.get(&second_id).unwrap().unwrap().status,
+        PairStatus::Active
+    );
 }

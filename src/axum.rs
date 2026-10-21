@@ -6,11 +6,15 @@
 //! `path_and_query()`; do not normalize routes/proxy paths on only one side.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode, header::HeaderName};
+use axum::http::{
+    HeaderMap, StatusCode,
+    header::{CONNECTION, HeaderName, HeaderValue},
+};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
@@ -41,6 +45,13 @@ pub struct BpcAxumState<R, N> {
     /// Bounds requests that can buffer a body before authentication. Keep a
     /// proxy/server read timeout in front of this adapter as well.
     body_collection_permits: Arc<Semaphore>,
+    /// Hard deadline for unauthenticated body collection. The adapter returns a
+    /// connection-closing timeout response when a streaming body stalls.
+    body_collection_timeout: Duration,
+    /// Bounds synchronous registry/nonce-store verification jobs placed on the
+    /// Tokio blocking executor so they cannot stall async worker threads.
+    verification_permits: Arc<Semaphore>,
+    verification_timeout: Duration,
     /// Public error behavior. Keep the default in every internet-facing
     /// deployment; detailed codes exist only for isolated development.
     pub error_disclosure: BpcPublicErrorDisclosure,
@@ -54,6 +65,9 @@ impl<R, N> Clone for BpcAxumState<R, N> {
             nonce_store: Arc::clone(&self.nonce_store),
             max_body_bytes: self.max_body_bytes,
             body_collection_permits: Arc::clone(&self.body_collection_permits),
+            body_collection_timeout: self.body_collection_timeout,
+            verification_permits: Arc::clone(&self.verification_permits),
+            verification_timeout: self.verification_timeout,
             error_disclosure: self.error_disclosure,
         }
     }
@@ -67,6 +81,9 @@ impl<R, N> BpcAxumState<R, N> {
             nonce_store,
             max_body_bytes: 2 * 1024 * 1024,
             body_collection_permits: Arc::new(Semaphore::new(64)),
+            body_collection_timeout: Duration::from_secs(5),
+            verification_permits: Arc::new(Semaphore::new(64)),
+            verification_timeout: Duration::from_secs(5),
             error_disclosure: BpcPublicErrorDisclosure::Generic,
         }
     }
@@ -81,6 +98,33 @@ impl<R, N> BpcAxumState<R, N> {
             return Err("body collection limit must be greater than zero");
         }
         self.body_collection_permits = Arc::new(Semaphore::new(max_in_flight));
+        Ok(self)
+    }
+
+    /// Sets the maximum duration of one pre-authentication body read.
+    pub fn with_body_collection_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> std::result::Result<Self, &'static str> {
+        if timeout.is_zero() {
+            return Err("body collection timeout must be greater than zero");
+        }
+        self.body_collection_timeout = timeout;
+        Ok(self)
+    }
+
+    /// Sets a bounded timeout and concurrency level for synchronous verifier
+    /// backends run on Tokio's dedicated blocking executor.
+    pub fn with_verification_limit(
+        mut self,
+        max_in_flight: usize,
+        timeout: Duration,
+    ) -> std::result::Result<Self, &'static str> {
+        if max_in_flight == 0 || timeout.is_zero() {
+            return Err("verification limit and timeout must be greater than zero");
+        }
+        self.verification_permits = Arc::new(Semaphore::new(max_in_flight));
+        self.verification_timeout = timeout;
         Ok(self)
     }
 }
@@ -119,28 +163,62 @@ where
         Ok(permit) => permit,
         Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "authentication_busy"),
     };
-    let body = match to_bytes(body, state.max_body_bytes).await {
-        Ok(bytes) => bytes,
-        Err(_) => return error_response(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"),
+    let body = match tokio::time::timeout(
+        state.body_collection_timeout,
+        to_bytes(body, state.max_body_bytes),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => return error_response(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"),
+        Err(_) => return timeout_response(),
     };
+    drop(_permit);
     let path = parts
         .uri
         .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/");
-    let result = state.verifier.verify(
-        BpcRequest {
-            pair_id: &pair_id,
-            signature: &signature,
-            signed_data: &signed_data,
-            version: &version,
-            method: parts.method.as_str(),
-            path,
-            body: &body,
-        },
-        state.registry.as_ref(),
-        state.nonce_store.as_ref(),
-    );
+        .map_or_else(|| "/".to_owned(), |value| value.as_str().to_owned());
+    let method = parts.method.as_str().to_owned();
+    let verification_permit = match Arc::clone(&state.verification_permits).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "authentication_busy"),
+    };
+    let verifier = state.verifier.clone();
+    let registry = Arc::clone(&state.registry);
+    let nonce_store = Arc::clone(&state.nonce_store);
+    let verify_body = body.clone();
+    let result = match tokio::time::timeout(
+        state.verification_timeout,
+        tokio::task::spawn_blocking(move || {
+            // A timed-out JoinHandle cannot cancel running blocking I/O. Keep
+            // the permit with that task until it truly finishes so at most the
+            // configured number of stalled backend calls can exist.
+            let _permit = verification_permit;
+            verifier.verify(
+                BpcRequest {
+                    pair_id: &pair_id,
+                    signature: &signature,
+                    signed_data: &signed_data,
+                    version: &version,
+                    method: &method,
+                    path: &path,
+                    body: &verify_body,
+                },
+                registry.as_ref(),
+                nonce_store.as_ref(),
+            )
+        }),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) | Err(_) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication_temporarily_unavailable",
+            );
+        }
+    };
     if !result.ok {
         let error = result.error.expect("denial contains an error");
         return error_response(
@@ -148,7 +226,12 @@ where
             public_code(error, state.error_disclosure),
         );
     }
-    let snapshot = result.snapshot.expect("success contains an auth snapshot");
+    let Some(snapshot) = result.snapshot else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication_temporarily_unavailable",
+        );
+    };
     let mut restored = Request::from_parts(parts, Body::from(body));
     restored.extensions_mut().insert(snapshot);
     next.run(restored).await
@@ -233,6 +316,14 @@ fn public_code(error: VerificationError, disclosure: BpcPublicErrorDisclosure) -
 
 fn error_response(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({ "error": { "code": code } }))).into_response()
+}
+
+fn timeout_response() -> Response {
+    let mut response = error_response(StatusCode::REQUEST_TIMEOUT, "authentication_timeout");
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+    response
 }
 
 /// Retrieves the verified BPC authorization snapshot from a protected handler.

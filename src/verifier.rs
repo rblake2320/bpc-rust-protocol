@@ -1,31 +1,76 @@
 use uuid::{Uuid, Variant, Version};
 
 use crate::{
-    AuthSnapshot, BPC_PROTOCOL_VERSION, BpcRequest, NonceStore, PairKind, PairRegistry, PairStatus,
-    SuccessClaim, VerificationError, VerificationResult, body_hash, is_valid_pair_id,
-    parse_canonical_payload, verify_payload_bytes, verify_request_hmac,
+    AuthSnapshot, BPC_PROTOCOL_VERSION, BpcError, BpcRequest, NonceStore, PairKind, PairMode,
+    PairRegistry, PairStatus, Result, SuccessClaim, VerificationError, VerificationResult,
+    body_hash, is_valid_audience, is_valid_pair_id, parse_canonical_payload, verify_payload_bytes,
+    verify_request_hmac,
 };
 
 const MAX_SIGNATURE_LEN: usize = 256;
 const MAX_SIGNED_DATA_LEN: usize = 4096;
+/// Five minutes permits operational clock skew while preventing a configuration
+/// typo from silently creating an indefinite replay window.
+pub const MAX_SIGNATURE_WINDOW_MS: u64 = 5 * 60 * 1_000;
 
 /// Portable BPC verifier settings.
 #[derive(Clone, Debug)]
 pub struct BpcVerifierConfig {
     /// Permitted difference between verifier and client clocks, in milliseconds.
-    pub signature_window_ms: u64,
-    /// Number of invalid P-256 signatures with a valid secret-HMAC factor before
-    /// a pair locks. Zero disables credential lockout; edge rate limiting still
-    /// applies to every denial.
-    pub lockout_after: u32,
+    signature_window_ms: u64,
+    /// Exact locally trusted credential audience. BPC v1 enforces this against
+    /// the authority record; BPC v2 signs and MACs the same value on the wire.
+    expected_audience: String,
+    /// Exact locally trusted lifecycle environment.
+    expected_mode: PairMode,
 }
 
 impl Default for BpcVerifierConfig {
     fn default() -> Self {
-        Self {
-            signature_window_ms: 60_000,
-            lockout_after: 10,
+        // The default is deliberately a local development trust domain. A
+        // production pair cannot authorize through it by accident.
+        Self::new("bpc://localhost/development", PairMode::Development)
+            .expect("static local-development verifier configuration is valid")
+    }
+}
+
+impl BpcVerifierConfig {
+    /// Builds a verifier configuration that only accepts one authority-record
+    /// audience and one operating mode.
+    pub fn new(expected_audience: impl Into<String>, expected_mode: PairMode) -> Result<Self> {
+        let expected_audience = expected_audience.into();
+        if !is_valid_audience(&expected_audience) {
+            return Err(BpcError::InvalidPayload("BPC audience is invalid".into()));
         }
+        Ok(Self {
+            signature_window_ms: 60_000,
+            expected_audience,
+            expected_mode,
+        })
+    }
+
+    /// Sets a bounded request freshness window. Values outside 1 ms through
+    /// five minutes are rejected rather than weakening replay protection.
+    pub fn with_signature_window_ms(mut self, value: u64) -> Result<Self> {
+        if value == 0 || value > MAX_SIGNATURE_WINDOW_MS {
+            return Err(BpcError::InvalidPayload(format!(
+                "signature window must be between 1 and {MAX_SIGNATURE_WINDOW_MS} ms"
+            )));
+        }
+        self.signature_window_ms = value;
+        Ok(self)
+    }
+
+    pub fn signature_window_ms(&self) -> u64 {
+        self.signature_window_ms
+    }
+
+    pub fn expected_audience(&self) -> &str {
+        &self.expected_audience
+    }
+
+    pub fn expected_mode(&self) -> PairMode {
+        self.expected_mode
     }
 }
 
@@ -115,6 +160,13 @@ impl BpcVerifier {
                 );
             }
         };
+        if pair.audience != self.config.expected_audience || pair.mode != self.config.expected_mode
+        {
+            return VerificationResult::denied(
+                Some(request.pair_id),
+                VerificationError::AudienceMismatch,
+            );
+        }
         match pair.status {
             PairStatus::Active => {}
             PairStatus::Revoked => {
@@ -141,12 +193,6 @@ impl BpcVerifier {
                     VerificationError::PairRotated,
                 );
             }
-        }
-        if self.config.lockout_after > 0 && pair.failed_signatures >= self.config.lockout_after {
-            return VerificationResult::denied(
-                Some(request.pair_id),
-                VerificationError::PairLocked,
-            );
         }
         if pair
             .expires_at_ms
@@ -256,9 +302,22 @@ impl BpcVerifier {
         let ttl_ms = self
             .config
             .signature_window_ms
-            .saturating_mul(2)
-            .saturating_add(10_000);
-        let replay = match nonce_store.check_and_consume(&payload.nonce, now_ms, ttl_ms) {
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(10_000))
+            .ok_or_else(|| BpcError::InvalidPayload("nonce retention overflows".into()));
+        let Ok(ttl_ms) = ttl_ms else {
+            return VerificationResult::denied(
+                Some(request.pair_id),
+                VerificationError::ReplayStoreUnavailable,
+            );
+        };
+        let replay = match nonce_store.check_and_consume(
+            request.pair_id,
+            &payload.nonce,
+            payload.timestamp,
+            now_ms,
+            ttl_ms,
+        ) {
             Ok(replay) => replay,
             Err(_) => {
                 return VerificationResult::denied(
@@ -308,17 +367,15 @@ impl BpcVerifier {
         }
     }
 
-    /// Only a request that has already proven the independent secret-HMAC
-    /// factor may affect credential-wide signature lockout state. All earlier
-    /// malformed or unauthenticated traffic must be handled by edge/source rate
-    /// limits, never by a pair-ID-controlled persistent lockout.
+    /// Invalid signatures deliberately never mutate credential state. A visible
+    /// on-wire HMAC tag can be replayed, so lockout must be implemented at a
+    /// trusted rate-limited edge rather than as a permanent pair-wide penalty.
     fn reject_authenticated_signature_failure<R: PairRegistry>(
         &self,
-        registry: &R,
+        _registry: &R,
         pair_id: &str,
         error: VerificationError,
     ) -> VerificationResult {
-        let _ = registry.record_failure(pair_id, self.config.lockout_after);
         VerificationResult::denied(Some(pair_id), error)
     }
 }

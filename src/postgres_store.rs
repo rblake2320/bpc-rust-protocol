@@ -162,6 +162,7 @@ CREATE TABLE IF NOT EXISTS bpc_pairs (
     name                  VARCHAR(128) NOT NULL CHECK (length(name) > 0),
     scope                 TEXT NOT NULL CHECK (scope IN ('read','read-write','admin')),
     mode                  TEXT NOT NULL CHECK (mode IN ('development','production')),
+    audience              VARCHAR(256) NOT NULL CHECK (audience ~ '^[A-Za-z0-9:./_-]+$'),
     request_hmac_ciphertext TEXT NOT NULL CHECK (length(request_hmac_ciphertext) <= 512),
     public_jwk            JSONB NOT NULL CHECK (
         public_jwk->>'kty' = 'EC' AND public_jwk->>'crv' = 'P-256'
@@ -232,6 +233,10 @@ pub struct PostgresAuthorityConfig {
     /// Mandatory envelope protector for HMAC verifier material and pending
     /// registrations. Supply a unique deployment key from a KMS/secret manager.
     pub secret_protector: PostgresSecretProtector,
+    /// Requires PostgreSQL to have a configured synchronous standby and waits
+    /// for `remote_apply` before acknowledging a security-state mutation.
+    /// Set `false` only for isolated single-node development/tests.
+    pub require_synchronous_replication: bool,
 }
 
 impl PostgresAuthorityConfig {
@@ -246,6 +251,7 @@ impl PostgresAuthorityConfig {
             approval_ttl_ms: 15 * 60 * 1_000,
             schema: "public".into(),
             secret_protector,
+            require_synchronous_replication: true,
         }
     }
 
@@ -317,6 +323,20 @@ impl PostgresPairAuthority {
         let mut tx = client.transaction().map_err(pg_error)?;
         tx.batch_execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SET LOCAL statement_timeout = '5s'; SET LOCAL lock_timeout = '2s';")
             .map_err(pg_error)?;
+        if self.config.require_synchronous_replication {
+            let configured: String = tx
+                .query_one("SHOW synchronous_standby_names", &[])
+                .map_err(pg_error)?
+                .get(0);
+            if configured.trim().is_empty() {
+                return Err(BpcError::PairRegistry(
+                    "PostgreSQL synchronous replication is required for security-state durability"
+                        .into(),
+                ));
+            }
+            tx.batch_execute("SET LOCAL synchronous_commit = 'remote_apply';")
+                .map_err(pg_error)?;
+        }
         Ok(tx)
     }
 }
@@ -505,6 +525,27 @@ impl PairAuthority for PostgresPairAuthority {
         )?;
         let registration: PairRegistration = serde_json::from_slice(&registration_json)?;
         registration.validate()?;
+        if registration
+            .expires_at_ms
+            .is_some_and(|expires_at| now_ms > expires_at)
+        {
+            tx.execute(
+                "DELETE FROM bpc_pending WHERE token_hash=$1",
+                &[&token_hash],
+            )
+            .map_err(pg_error)?;
+            tx.commit().map_err(pg_error)?;
+            return Err(BpcError::PairRegistry(
+                "pair registration has already expired".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE bpc_pairs
+             SET status='expired', authorization_version=authorization_version+1
+             WHERE status='active' AND expires_at_ms IS NOT NULL AND expires_at_ms < $1",
+            &[&to_i64(now_ms)?],
+        )
+        .map_err(pg_error)?;
         let active: i64 = tx
             .query_one("SELECT count(*) FROM bpc_pairs WHERE status='active'", &[])
             .map_err(pg_error)?
@@ -524,6 +565,7 @@ impl PairAuthority for PostgresPairAuthority {
             name: registration.name,
             scope: registration.scope,
             mode: registration.mode,
+            audience: registration.audience,
             request_hmac_key: registration.request_hmac_key,
             public_jwk: registration.public_jwk,
             status: PairStatus::Active,
@@ -535,6 +577,7 @@ impl PairAuthority for PostgresPairAuthority {
             authorization_version: 1,
             kind: registration.kind,
             canary_class: registration.canary_class,
+            replaced_by: None,
         };
         insert_pair(&mut tx, &pair, &self.config.secret_protector)?;
         let deleted = tx
@@ -554,12 +597,35 @@ impl PairAuthority for PostgresPairAuthority {
 
     fn revoke(&self, pair_id: &str) -> Result<bool> {
         let mut client = self.lock_client()?;
-        let changed = client.execute(
-            "UPDATE bpc_pairs SET status='revoked', authorization_version=authorization_version+1
-             WHERE id=$1 AND status <> 'revoked'",
-            &[&pair_id],
-        ).map_err(pg_error)?;
-        Ok(changed == 1)
+        let mut tx = self.begin(&mut client)?;
+        // Taking the root row lock before resolving descendants makes a racing
+        // rotation serialize or fail, never report a successful partial revoke.
+        let exists = tx
+            .query_opt(
+                "SELECT id FROM bpc_pairs WHERE id=$1 FOR UPDATE",
+                &[&pair_id],
+            )
+            .map_err(pg_error)?;
+        if exists.is_none() {
+            tx.commit().map_err(pg_error)?;
+            return Ok(false);
+        }
+        let changed = tx
+            .execute(
+                "WITH RECURSIVE lineage(id) AS (
+                    SELECT id FROM bpc_pairs WHERE id=$1
+                    UNION
+                    SELECT predecessor.replaced_by
+                    FROM bpc_pairs predecessor JOIN lineage parent ON predecessor.id=parent.id
+                    WHERE predecessor.replaced_by IS NOT NULL
+                 )
+                 UPDATE bpc_pairs SET status='revoked', authorization_version=authorization_version+1
+                 WHERE id IN (SELECT id FROM lineage) AND status <> 'revoked'",
+                &[&pair_id],
+            )
+            .map_err(pg_error)?;
+        tx.commit().map_err(pg_error)?;
+        Ok(changed > 0)
     }
 
     fn rotate_pair(&self, expected_old: &PairRecord, replacement: PairRecord) -> Result<bool> {
@@ -612,7 +678,7 @@ impl PairAuthority for PostgresPairAuthority {
     fn list_redacted(&self) -> Result<Vec<RedactedPair>> {
         let mut client = self.lock_client()?;
         let rows = client.query(
-            "SELECT id,name,scope,mode,status,created_at_ms,requests FROM bpc_pairs ORDER BY created_at_ms DESC",
+            "SELECT id,name,scope,mode,audience,status,created_at_ms,requests FROM bpc_pairs ORDER BY created_at_ms DESC",
             &[],
         ).map_err(pg_error)?;
         rows.into_iter()
@@ -622,6 +688,7 @@ impl PairAuthority for PostgresPairAuthority {
                     name: row.get("name"),
                     scope: parse_scope(&row.get::<_, String>("scope"))?,
                     mode: parse_mode(&row.get::<_, String>("mode"))?,
+                    audience: row.get("audience"),
                     status: parse_status(&row.get::<_, String>("status"))?,
                     created_at_ms: from_i64(row.get("created_at_ms"))?,
                     requests: from_i64(row.get("requests"))?,
@@ -752,7 +819,68 @@ impl AuditLog for PostgresAuditLog {
     }
 
     fn verify(&self, expected_anchor: Option<&AuditHead>) -> Result<AuditVerification> {
-        crate::verify_audit_entries(&self.entries()?, expected_anchor)
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| BpcError::PairRegistry("PostgreSQL audit client lock poisoned".into()))?;
+        let mut tx = client.transaction().map_err(pg_error)?;
+        tx.batch_execute(
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = '5s';",
+        )
+        .map_err(pg_error)?;
+        let stored_head = tx
+            .query_one(
+                "SELECT sequence,chain_hash,count FROM bpc_audit_head WHERE singleton=TRUE",
+                &[],
+            )
+            .map_err(pg_error)?;
+        let rows = tx
+            .query(
+                "SELECT * FROM bpc_audit ORDER BY sequence ASC LIMIT $1",
+                &[
+                    &i64::try_from(crate::DEFAULT_AUDIT_VERIFY_MAX_ENTRIES + 1).map_err(|_| {
+                        BpcError::PairRegistry("audit verification limit invalid".into())
+                    })?,
+                ],
+            )
+            .map_err(pg_error)?;
+        tx.commit().map_err(pg_error)?;
+        if rows.len() > crate::DEFAULT_AUDIT_VERIFY_MAX_ENTRIES {
+            return Ok(AuditVerification {
+                valid: false,
+                broken_at_sequence: None,
+                reason: Some("verification_work_limit_exceeded"),
+            });
+        }
+        let entries = rows
+            .into_iter()
+            .map(row_to_audit)
+            .collect::<Result<Vec<_>>>()?;
+        let mut verification = crate::verify_audit_entries(&entries, expected_anchor)?;
+        let stored_head = AuditHead {
+            sequence: from_i64(stored_head.get("sequence"))?,
+            chain_hash: stored_head.get("chain_hash"),
+            count: from_i64(stored_head.get("count"))?,
+        };
+        let computed_head = match entries.last() {
+            Some(entry) => AuditHead {
+                sequence: entry.sequence,
+                chain_hash: entry.chain_hash.clone(),
+                count: u64::try_from(entries.len())
+                    .map_err(|_| BpcError::PairRegistry("audit entry count invalid".into()))?,
+            },
+            None => AuditHead {
+                sequence: 0,
+                chain_hash: crate::GENESIS_HASH.into(),
+                count: 0,
+            },
+        };
+        if stored_head != computed_head {
+            verification.valid = false;
+            verification.broken_at_sequence = Some(stored_head.sequence);
+            verification.reason = Some("persisted_head_mismatch");
+        }
+        Ok(verification)
     }
 }
 
@@ -768,12 +896,12 @@ fn insert_pair(
         pair.request_hmac_key.as_bytes(),
     )?;
     let rows = tx.execute(
-        "INSERT INTO bpc_pairs(id,name,scope,mode,request_hmac_ciphertext,public_jwk,status,created_at_ms,expires_at_ms,max_requests,requests,failed_signatures,authorization_version,kind,canary_class)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
-        &[&pair.id, &pair.name, &scope_text(pair.scope), &mode_text(pair.mode), &request_hmac_ciphertext, &jwk,
+        "INSERT INTO bpc_pairs(id,name,scope,mode,audience,request_hmac_ciphertext,public_jwk,status,created_at_ms,expires_at_ms,max_requests,requests,failed_signatures,authorization_version,kind,canary_class,replaced_by)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
+        &[&pair.id, &pair.name, &scope_text(pair.scope), &mode_text(pair.mode), &pair.audience, &request_hmac_ciphertext, &jwk,
           &status_text(pair.status), &to_i64(pair.created_at_ms)?, &option_i64(pair.expires_at_ms)?, &option_i64(pair.max_requests)?,
           &to_i64(pair.requests)?, &i32::try_from(pair.failed_signatures).map_err(|_| BpcError::PairRegistry("failed signatures overflow".into()))?,
-          &to_i64(pair.authorization_version)?, &kind_text(pair.kind), &pair.canary_class.map(canary_text)],
+          &to_i64(pair.authorization_version)?, &kind_text(pair.kind), &pair.canary_class.map(canary_text), &pair.replaced_by],
     ).map_err(pg_error)?;
     if rows != 1 {
         return Err(BpcError::PairRegistry(
@@ -797,6 +925,7 @@ fn row_to_pair(row: Row, secret_protector: &PostgresSecretProtector) -> Result<P
         name: row.get("name"),
         scope: parse_scope(&row.get::<_, String>("scope"))?,
         mode: parse_mode(&row.get::<_, String>("mode"))?,
+        audience: row.get("audience"),
         request_hmac_key,
         public_jwk,
         status: parse_status(&row.get::<_, String>("status"))?,
@@ -812,6 +941,7 @@ fn row_to_pair(row: Row, secret_protector: &PostgresSecretProtector) -> Result<P
             .get::<_, Option<String>>("canary_class")
             .map(|value| parse_canary(&value))
             .transpose()?,
+        replaced_by: row.get("replaced_by"),
     };
     pair.validate()?;
     Ok(pair)

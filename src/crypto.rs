@@ -13,6 +13,7 @@ use crate::{BpcError, BpcPayload, PublicJwk, Result, RotationPayload};
 
 const HKDF_SALT: &[u8] = b"bpc-protocol-hmac-salt-v1";
 const HKDF_INFO: &[u8] = b"bpc-v1-hmac-key";
+const ROTATION_HMAC_DOMAIN: &[u8] = b"bpc-rotation-hmac-v2\0";
 
 /// Base64url-encodes bytes without padding, as required by BPC v1.
 pub fn b64url_encode(bytes: impl AsRef<[u8]>) -> String {
@@ -96,6 +97,50 @@ pub fn verify_request_hmac(
     };
     mac.update(nonce.as_bytes());
     mac.update(timestamp.to_string().as_bytes());
+    mac.verify_slice(&tag).is_ok()
+}
+
+/// Computes the second factor for a rotation over the exact canonical rotation
+/// transcript under an unambiguous domain label. Unlike the legacy request
+/// HMAC, a captured request tag cannot be transplanted into this operation.
+pub fn rotation_hmac(request_hmac_key: &str, canonical_rotation: &[u8]) -> Result<String> {
+    let key = b64url_decode(request_hmac_key)?;
+    if key.len() != 32 {
+        return Err(BpcError::InvalidHmacKey);
+    }
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key).map_err(|_| BpcError::InvalidHmacKey)?;
+    mac.update(ROTATION_HMAC_DOMAIN);
+    mac.update(canonical_rotation);
+    Ok(b64url_encode(mac.finalize().into_bytes()))
+}
+
+/// Constant-time validates the domain-separated full-rotation transcript HMAC.
+pub fn verify_rotation_hmac(
+    request_hmac_key: &str,
+    canonical_rotation: &[u8],
+    provided_hmac: &str,
+) -> bool {
+    if provided_hmac.len() != 43
+        || !provided_hmac
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return false;
+    }
+    let Ok(key) = b64url_decode(request_hmac_key) else {
+        return false;
+    };
+    let Ok(tag) = b64url_decode(provided_hmac) else {
+        return false;
+    };
+    if key.len() != 32 || tag.len() != 32 {
+        return false;
+    }
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&key) else {
+        return false;
+    };
+    mac.update(ROTATION_HMAC_DOMAIN);
+    mac.update(canonical_rotation);
     mac.verify_slice(&tag).is_ok()
 }
 

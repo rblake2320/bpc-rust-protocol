@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use redis::{Client, Connection};
 
-use crate::{BpcError, NonceStore, Result};
+use crate::{BpcError, MAX_SIGNATURE_WINDOW_MS, NonceStore, Result};
 
 const DEFAULT_SAFETY_BUFFER_MS: u64 = 10_000;
 const DEFAULT_CONTINUITY_ALLOWANCE_MS: u64 = 30_000;
@@ -36,6 +36,13 @@ if marker ~= ARGV[1] then
 end
 if redis.call('GET', KEYS[3]) then
   return 'QUARANTINED'
+end
+local current_time = redis.call('TIME')
+local now_ms = tonumber(current_time[1]) * 1000 + math.floor(tonumber(current_time[2]) / 1000)
+local signed_timestamp_ms = tonumber(ARGV[5])
+local window_ms = tonumber(ARGV[6])
+if math.abs(now_ms - signed_timestamp_ms) > window_ms then
+  return 'STALE'
 end
 local accepted = redis.call('SET', KEYS[1], '1', 'NX', 'PX', ARGV[2])
 if accepted then
@@ -83,6 +90,10 @@ pub struct GovernedRedisNonceConfig {
     pub continuity_allowance_ms: u64,
     /// Maximum duration of each blocking Redis command.
     pub command_timeout: Duration,
+    /// Minimum replicas that must acknowledge a fresh nonce write before the
+    /// verifier may authorize it. One is the secure production default; zero
+    /// is permitted only with explicit insecure-loopback development mode.
+    pub min_replica_acks: usize,
     /// Allows `redis://` only for a literal loopback host in isolated tests or
     /// local development. Production defaults to verified `rediss://`.
     pub allow_insecure_loopback: bool,
@@ -101,6 +112,7 @@ impl GovernedRedisNonceConfig {
             safety_buffer_ms: DEFAULT_SAFETY_BUFFER_MS,
             continuity_allowance_ms: DEFAULT_CONTINUITY_ALLOWANCE_MS,
             command_timeout: Duration::from_secs(2),
+            min_replica_acks: 1,
             allow_insecure_loopback: false,
         };
         config.validate()?;
@@ -135,9 +147,19 @@ impl GovernedRedisNonceConfig {
                 "Redis continuity epoch is invalid".into(),
             ));
         }
-        if self.signature_window_ms == 0 || self.command_timeout.is_zero() {
+        if self.signature_window_ms == 0
+            || self.signature_window_ms > MAX_SIGNATURE_WINDOW_MS
+            || self.command_timeout.is_zero()
+        {
             return Err(BpcError::NonceStore(
                 "Redis nonce durations must be positive".into(),
+            ));
+        }
+        if self.min_replica_acks > 16
+            || (self.min_replica_acks == 0 && !self.allow_insecure_loopback)
+        {
+            return Err(BpcError::NonceStore(
+                "Redis replica acknowledgement policy is invalid".into(),
             ));
         }
         self.retention_ms()?;
@@ -244,7 +266,14 @@ impl GovernedRedisNonceStore {
 }
 
 impl NonceStore for GovernedRedisNonceStore {
-    fn check_and_consume(&self, nonce: &str, _now_ms: u64, ttl_ms: u64) -> Result<bool> {
+    fn check_and_consume(
+        &self,
+        pair_id: &str,
+        nonce: &str,
+        signed_timestamp_ms: u64,
+        _now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<bool> {
         if self.locally_quarantined.load(Ordering::Acquire) {
             return Err(BpcError::NonceStore(
                 "Redis nonce gate is locally quarantined".into(),
@@ -259,7 +288,7 @@ impl NonceStore for GovernedRedisNonceStore {
         let result = (|| {
             let mut connection = self.lock_connection()?;
             let keys = continuity_keys(&self.config.namespace);
-            let nonce_key = format!("{}{}", keys.nonce_prefix, nonce);
+            let nonce_key = format!("{}{}:{nonce}", keys.nonce_prefix, pair_id);
             let reply: String = redis::cmd("EVAL")
                 .arg(CONSUME_SCRIPT)
                 .arg(4)
@@ -271,12 +300,20 @@ impl NonceStore for GovernedRedisNonceStore {
                 .arg(self.config.retention_ms()?)
                 .arg(self.config.quarantine_ms()?)
                 .arg(expected_config(&self.config)?)
+                .arg(signed_timestamp_ms)
+                .arg(self.config.signature_window_ms)
                 .query(&mut *connection)
                 .map_err(redis_error)?;
             Ok(reply)
         })();
         match result {
-            Ok(reply) if reply == "FRESH" => Ok(false),
+            Ok(reply) if reply == "FRESH" => {
+                if let Err(error) = self.require_replica_acks() {
+                    self.locally_quarantined.store(true, Ordering::Release);
+                    return Err(error);
+                }
+                Ok(false)
+            }
             Ok(reply) if reply == "REPLAY" => Ok(true),
             Ok(reply) => {
                 self.locally_quarantined.store(true, Ordering::Release);
@@ -291,6 +328,29 @@ impl NonceStore for GovernedRedisNonceStore {
                 Err(error)
             }
         }
+    }
+}
+
+impl GovernedRedisNonceStore {
+    fn require_replica_acks(&self) -> Result<()> {
+        if self.config.min_replica_acks == 0 {
+            return Ok(());
+        }
+        let mut connection = self.lock_connection()?;
+        let acknowledged: i64 = redis::cmd("WAIT")
+            .arg(self.config.min_replica_acks)
+            .arg(self.config.command_timeout.as_millis())
+            .query(&mut *connection)
+            .map_err(redis_error)?;
+        let required = i64::try_from(self.config.min_replica_acks)
+            .map_err(|_| BpcError::NonceStore("Redis replica count is invalid".into()))?;
+        if acknowledged < required {
+            return Err(BpcError::NonceStore(
+                "Redis nonce write did not reach the required replica acknowledgement quorum"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 

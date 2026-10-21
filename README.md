@@ -4,7 +4,7 @@ A hardened Rust implementation of **BPC v1 (Bound Pair Credentials)**: signed HT
 
 The crate is designed for interoperability with the existing BPC TypeScript and Python implementations while offering a production Rust stack for Axum, Redis, and PostgreSQL.
 
-> **Status:** BPC v1 implementation with real Axum, Redis, PostgreSQL, Reqwest, audit-chain, rotation, canary-pair, and cross-language compatibility coverage. Review `SECURITY.md` and the [cryptographic assurance and v2 design](docs/BPC_CRYPTOGRAPHIC_ASSURANCE.md) before production rollout.
+> **Status:** BPC v1 compatibility implementation with hardened authority, replay, transport, and adapter boundaries. Version 0.2 is an intentional security API break: every pair has a trusted audience, every verifier has an explicit audience/mode policy, and rotation requires both factors. Review [`SECURITY.md`](SECURITY.md), the [cryptographic assurance and v2 design](docs/BPC_CRYPTOGRAPHIC_ASSURANCE.md), and the [peer-review package](docs/PEER_REVIEW.md) before production rollout.
 
 ## What it protects
 
@@ -16,6 +16,7 @@ Each accepted request proves all of the following before application authorizati
 - The signature binds the exact uppercase method, `path_and_query`, and raw body SHA-256 digest.
 - The nonce is a UUID v4 and is fresh; durable Redis protection admits it once only.
 - The pair policy did not change while cryptography/replay checks were in progress; a final version-fenced claim succeeds atomically.
+- The loaded pair is bound to the verifier's exact configured audience and operating mode; production credentials do not work through the local-development default.
 
 ## Features
 
@@ -51,11 +52,12 @@ let pairs = MemoryPairRegistry::default();
 pairs.insert(PairRecord {
     id: "pair_example".into(), name: "example".into(),
     scope: Scope::ReadWrite, mode: PairMode::Development,
+    audience: "bpc://localhost/development".into(),
     request_hmac_key: derive_request_hmac_key(&secret)?,
     public_jwk: key_pair.public_jwk().clone(), status: PairStatus::Active,
     created_at_ms: bpc_protocol::unix_ms()?, expires_at_ms: None, max_requests: None,
     requests: 0, failed_signatures: 0, authorization_version: 1,
-    kind: PairKind::Legitimate, canary_class: None,
+    kind: PairKind::Legitimate, canary_class: None, replaced_by: None,
 })?;
 
 let body = br#"{"action":"create"}"#;
@@ -99,11 +101,11 @@ let authority = PostgresPairAuthority::connect_tls(
 authority.migrate()?; // Run during controlled provisioning, not every app start.
 ```
 
-`connect_tls` requires `sslmode=verify-full` in the PostgreSQL URL and validates the hostname/certificate chain against the system trust store. `connect` is limited to literal loopback endpoints for isolated tests. Keep the envelope key in a KMS/secret manager, rotate it with an explicit re-encryption migration, and separately encrypt volumes/backups with least-privilege database roles.
+`connect_tls` requires `sslmode=verify-full` in the PostgreSQL URL and validates the hostname/certificate chain against the system trust store. `connect` is limited to literal loopback endpoints for isolated tests. `PostgresAuthorityConfig::new` requires a configured synchronous PostgreSQL standby and `remote_apply` acknowledgement for security-state mutations; do not set `require_synchronous_replication = false` outside a deliberately isolated test/single-node development environment. Keep the envelope key in a KMS/secret manager, rotate it with a controlled re-encryption migration, and separately encrypt volumes/backups with least-privilege database roles.
 
 ### 2. Governed Redis replay defense
 
-The Redis store will only operate when `maxmemory-policy=noeviction`; an eviction-capable Redis instance is unsafe for replay prevention. It requires verified `rediss://` in production; `redis://` is available only after an explicit `allow_insecure_loopback` opt-in for a literal loopback development endpoint. Configure ACL/authentication, dedicate the database/cluster tenancy, and grant the `CONFIG GET maxmemory-policy` permission needed for the safety check.
+The Redis store will only operate when `maxmemory-policy=noeviction`; an eviction-capable Redis instance is unsafe for replay prevention. It requires verified `rediss://` in production; `redis://` is available only after an explicit `allow_insecure_loopback` opt-in for a literal loopback development endpoint. Its production default requires one Redis replica acknowledgement for every fresh nonce (`min_replica_acks = 1`) and independently checks the signed timestamp against Redis server time. Configure ACL/authentication, dedicated tenancy, replication, and the `CONFIG GET maxmemory-policy` permission needed for the safety check.
 
 ```rust
 use bpc_protocol::{GovernedRedisNonceConfig, GovernedRedisNonceStore};
@@ -138,7 +140,7 @@ let app = Router::new().layer(middleware::from_fn_with_state(state, bpc_axum_mid
 # Ok::<(), bpc_protocol::BpcError>(())
 ```
 
-`AuthSnapshot` is inserted into request extensions only after successful final authorization. The adapter defaults to generic public authentication failures, rejects oversized declared bodies before buffering, and bounds concurrent body collection. Set `state.max_body_bytes` and `state.with_body_collection_limit(...)` for expected request volume; retain server/proxy header, body-read, connection, and trusted-source rate limits. Ordinary BPC v1 requests must have a precomputed exact-body digest, so streaming uploads need an explicit protocol design.
+`AuthSnapshot` is inserted into request extensions only after successful final authorization. The adapter defaults to generic public authentication failures, rejects oversized declared bodies before buffering, bounds concurrent body collection, enforces a body-read deadline, and bounds deadline-aware blocking verifier jobs. Set `state.max_body_bytes`, `state.with_body_collection_limit(...)`, `state.with_body_collection_timeout(...)`, and `state.with_verification_limit(...)` for expected request volume; retain server/proxy header, body-read, connection, and trusted-source rate limits. Ordinary BPC v1 requests must have a precomputed exact-body digest, so streaming uploads need an explicit protocol design.
 
 ## Pair lifecycle and rotation
 
@@ -147,8 +149,8 @@ let app = Router::new().layer(middleware::from_fn_with_state(state, bpc_axum_mid
 1. `request_pairing` validates public P-256 material and stores a short-lived pending request.
 2. An authenticated management service calls `approve_pairing` after human/policy approval.
 3. Only the returned pair ID is exposed; management list views are redacted and never include HMAC material.
-4. `sign_rotation_at` signs a canonical rotation payload with the old key.
-5. `verify_and_rotate_at` validates the old signature and atomically retires the old pair before activating the successor.
+4. `sign_rotation_at` generates a canonical UUID-v4 nonce-bound transcript and authenticates it with both the old P-256 key and a domain-separated HMAC derived from the registration secret.
+5. `verify_and_rotate_at` validates both factors, freshness, binding, and an actual key change before atomically retiring the old pair and activating the successor. Revoking any pair revokes every reachable successor in its stored lineage.
 
 An authorization version fence means a request cryptographically checked before a concurrent revoke/rotation/policy mutation cannot complete the final claim as though the old policy still applied.
 
@@ -164,7 +166,7 @@ A database-only chain cannot prevent a privileged rollback/fork/tail truncation.
 
 ## Continuous integration
 
-The repository includes the full Redis/PostgreSQL service-tested GitHub Actions definition at [`ci/github-actions-ci.yml`](ci/github-actions-ci.yml). It pins actions to commit SHAs, service images to immutable digests, uses read-only permissions, disables persisted checkout credentials, locks the Rust dependency graph, and runs `cargo-audit`. Promote that file to `.github/workflows/ci.yml` to activate it in GitHub Actions. The initial publication credential used for this repository lacks GitHub’s `workflows` permission, so it cannot create workflow files remotely; activate the reviewed template through a credential with that narrowly scoped permission, then require it in branch protection.
+The repository includes the full Redis/PostgreSQL service-tested GitHub Actions definition at [`ci/github-actions-ci.yml`](ci/github-actions-ci.yml). It pins actions to commit SHAs, service images to immutable digests, uses read-only permissions, disables persisted checkout credentials, locks the Rust dependency graph, and runs both `cargo-audit` and the explicit [`deny.toml`](deny.toml) policy. Promote that file to `.github/workflows/ci.yml` to activate it in GitHub Actions, then require it in branch protection.
 
 Before calling an application or a BPC–TSK composition production-vetted, satisfy the evidence requirements in [`docs/PRODUCTION_RELEASE_GATES.md`](docs/PRODUCTION_RELEASE_GATES.md). They deliberately include controls that cannot be delivered by a protocol crate alone.
 
@@ -177,6 +179,7 @@ The test suite covers:
 - invalid-signature nonce preservation;
 - ghost-pair fail-closed behavior;
 - signed rotation and replay prevention;
+- audience/mode isolation, pair-scoped nonce identities, expiry-capacity release, revocation lineage, and dual-factor rotation rejection;
 - tamper-evident audit verification;
 - Node WebCrypto → Rust golden fixture;
 - Rust → Node WebCrypto independent verification;
@@ -191,6 +194,8 @@ export BPC_TEST_POSTGRES_URL='postgres://postgres:postgres@127.0.0.1:5432/postgr
 cargo test --all-features --all-targets
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo audit --deny warnings
+cargo deny check all
 node scripts/verify-node-interop.mjs
 ```
 

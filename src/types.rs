@@ -14,6 +14,8 @@ use crate::{BpcError, Result};
 pub const BPC_PROTOCOL_VERSION: &str = "1.0";
 /// Largest integer that remains exactly representable in JavaScript and JSON.
 pub const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+/// Maximum length of a locally configured BPC audience identifier.
+pub const MAX_AUDIENCE_LEN: usize = 256;
 
 /// A public ECDSA P-256 JWK accepted by BPC v1.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +270,10 @@ pub struct PairRecord {
     pub name: String,
     pub scope: Scope,
     pub mode: PairMode,
+    /// Locally configured trust domain, for example
+    /// `bpc://api.example.test/tenant-a/production`. It is an authority-record
+    /// binding for BPC v1; v2 additionally signs and MACs it on the wire.
+    pub audience: String,
     /// Base64url HKDF-derived request HMAC key. It is verifier material, not a password hash.
     pub request_hmac_key: String,
     pub public_jwk: PublicJwk,
@@ -283,6 +289,10 @@ pub struct PairRecord {
     pub authorization_version: u64,
     pub kind: PairKind,
     pub canary_class: Option<CanaryClass>,
+    /// Successor created by a rotation. This lineage is traversed for a
+    /// credential-family revocation.
+    #[serde(default)]
+    pub replaced_by: Option<String>,
 }
 
 impl PairRecord {
@@ -293,6 +303,7 @@ impl PairRecord {
         }
         if self.name.is_empty()
             || self.name.chars().count() > 128
+            || !is_valid_audience(&self.audience)
             || self.created_at_ms > MAX_JS_SAFE_INTEGER
             || self
                 .expires_at_ms
@@ -306,14 +317,7 @@ impl PairRecord {
             ));
         }
         self.public_jwk.to_verifying_key()?;
-        let hmac_key = URL_SAFE_NO_PAD
-            .decode(&self.request_hmac_key)
-            .map_err(|_| BpcError::PairRegistry("request HMAC key is not base64url".into()))?;
-        if hmac_key.len() != 32 {
-            return Err(BpcError::PairRegistry(
-                "request HMAC key must decode to 32 bytes".into(),
-            ));
-        }
+        validate_request_hmac_key(&self.request_hmac_key)?;
         if matches!(self.kind, PairKind::Ghost) != self.canary_class.is_some() {
             return Err(BpcError::PairRegistry(
                 "ghost pairs require a canary class and legitimate pairs cannot have one".into(),
@@ -354,6 +358,7 @@ pub enum VerificationError {
     InvalidSignedData,
     VersionMismatch,
     UnknownPair,
+    AudienceMismatch,
     PairRevoked,
     PairLocked,
     PairExpired,
@@ -381,6 +386,7 @@ impl VerificationError {
             Self::InvalidSignedData => "invalid_signed_data",
             Self::VersionMismatch => "version_mismatch",
             Self::UnknownPair => "unknown_pair",
+            Self::AudienceMismatch => "audience_mismatch",
             Self::PairRevoked => "pair_revoked",
             Self::PairLocked => "pair_locked",
             Self::PairExpired => "pair_expired",
@@ -450,9 +456,17 @@ pub trait PairRegistry: Send + Sync {
     fn claim_success(&self, expected: &PairRecord, now_ms: u64) -> Result<SuccessClaim>;
 }
 
-/// Atomic nonce first-use contract. Returning `true` means the nonce was already consumed.
+/// Atomic nonce first-use contract. Returning `true` means this authenticated
+/// pair has already consumed the nonce.
 pub trait NonceStore: Send + Sync {
-    fn check_and_consume(&self, nonce: &str, now_ms: u64, ttl_ms: u64) -> Result<bool>;
+    fn check_and_consume(
+        &self,
+        pair_id: &str,
+        nonce: &str,
+        signed_timestamp_ms: u64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<bool>;
 }
 
 /// One-process, mutex-protected pair registry. It is not a durable production store.
@@ -499,6 +513,105 @@ impl MemoryPairRegistry {
             .count())
     }
 
+    /// Transitions elapsed active pairs and returns the remaining active count
+    /// while holding one registry lock. A pair is valid at its exact expiry
+    /// millisecond and expires immediately after it.
+    pub fn expire_due_and_active_count(&self, now_ms: u64) -> Result<usize> {
+        let mut pairs = self
+            .pairs
+            .lock()
+            .map_err(|_| BpcError::PairRegistry("memory registry lock poisoned".into()))?;
+        for pair in pairs.values_mut() {
+            if pair.status == PairStatus::Active
+                && pair
+                    .expires_at_ms
+                    .is_some_and(|expires_at| now_ms > expires_at)
+            {
+                pair.status = PairStatus::Expired;
+                pair.authorization_version = pair.authorization_version.saturating_add(1);
+            }
+        }
+        Ok(pairs
+            .values()
+            .filter(|pair| pair.status == PairStatus::Active)
+            .count())
+    }
+
+    /// Atomically expires elapsed pairs, checks capacity, and inserts one
+    /// approved active pair. This keeps the in-memory development authority
+    /// aligned with production's transactional capacity semantics.
+    pub fn insert_approved_if_capacity(
+        &self,
+        pair: PairRecord,
+        max_active_pairs: usize,
+        now_ms: u64,
+    ) -> Result<()> {
+        pair.validate()?;
+        if pair.status != PairStatus::Active {
+            return Err(BpcError::PairRegistry(
+                "approved memory pair must be active".into(),
+            ));
+        }
+        let mut pairs = self
+            .pairs
+            .lock()
+            .map_err(|_| BpcError::PairRegistry("memory registry lock poisoned".into()))?;
+        for existing in pairs.values_mut() {
+            if existing.status == PairStatus::Active
+                && existing
+                    .expires_at_ms
+                    .is_some_and(|expires_at| now_ms > expires_at)
+            {
+                existing.status = PairStatus::Expired;
+                existing.authorization_version = existing.authorization_version.saturating_add(1);
+            }
+        }
+        if pairs
+            .values()
+            .filter(|existing| existing.status == PairStatus::Active)
+            .count()
+            >= max_active_pairs
+        {
+            return Err(BpcError::PairRegistry(format!(
+                "maximum pair capacity ({max_active_pairs}) reached"
+            )));
+        }
+        if pairs.contains_key(&pair.id) {
+            return Err(BpcError::PairRegistry("pair ID already exists".into()));
+        }
+        pairs.insert(pair.id.clone(), pair);
+        Ok(())
+    }
+
+    /// Atomically revokes a pair and all rotation descendants.
+    pub fn revoke_lineage(&self, pair_id: &str) -> Result<bool> {
+        let mut pairs = self
+            .pairs
+            .lock()
+            .map_err(|_| BpcError::PairRegistry("memory registry lock poisoned".into()))?;
+        if !pairs.contains_key(pair_id) {
+            return Ok(false);
+        }
+        let mut pending = vec![pair_id.to_owned()];
+        let mut changed = false;
+        while let Some(current_id) = pending.pop() {
+            let successor = pairs
+                .get(&current_id)
+                .and_then(|pair| pair.replaced_by.clone());
+            if let Some(pair) = pairs.get_mut(&current_id) {
+                if pair.status != PairStatus::Revoked {
+                    pair.status = PairStatus::Revoked;
+                    pair.authorization_version = pair.authorization_version.saturating_add(1);
+                    changed = true;
+                }
+            }
+            if let Some(successor) = successor {
+                pending.push(successor);
+            }
+        }
+        Ok(changed)
+    }
+
     /// Returns detached pair records for trusted in-process management logic.
     /// Do not serialize these records to an untrusted caller because they contain
     /// public-key and verifier-key metadata.
@@ -534,6 +647,7 @@ impl MemoryPairRegistry {
         let mut retired = current.clone();
         retired.status = PairStatus::Rotated;
         retired.authorization_version = retired.authorization_version.saturating_add(1);
+        retired.replaced_by = Some(replacement.id.clone());
         pairs.insert(retired.id.clone(), retired);
         pairs.insert(replacement.id.clone(), replacement);
         Ok(true)
@@ -642,16 +756,24 @@ impl MemoryNonceStore {
 }
 
 impl NonceStore for MemoryNonceStore {
-    fn check_and_consume(&self, nonce: &str, now_ms: u64, ttl_ms: u64) -> Result<bool> {
+    fn check_and_consume(
+        &self,
+        pair_id: &str,
+        nonce: &str,
+        _signed_timestamp_ms: u64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<bool> {
         let mut nonces = self
             .nonces
             .lock()
             .map_err(|_| BpcError::NonceStore("memory nonce store lock poisoned".into()))?;
         nonces.retain(|_, expires_at| *expires_at > now_ms);
-        if nonces.contains_key(nonce) {
+        let identity = format!("{pair_id}:{nonce}");
+        if nonces.contains_key(&identity) {
             return Ok(true);
         }
-        nonces.insert(nonce.to_owned(), now_ms.saturating_add(ttl_ms));
+        nonces.insert(identity, now_ms.saturating_add(ttl_ms));
         Ok(false)
     }
 }
@@ -663,4 +785,34 @@ pub fn is_valid_pair_id(pair_id: &str) -> bool {
         && pair_id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Validates the exact base64url representation of a 32-byte BPC request-HMAC
+/// verifier before attempting a decoded allocation.
+pub fn validate_request_hmac_key(value: &str) -> Result<()> {
+    if value.len() != 43 || !value.bytes().all(is_b64url) {
+        return Err(BpcError::PairRegistry(
+            "request HMAC key must be a 43-character unpadded base64url value".into(),
+        ));
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| BpcError::PairRegistry("request HMAC key is not base64url".into()))?;
+    if decoded.len() != 32 {
+        return Err(BpcError::PairRegistry(
+            "request HMAC key must decode to 32 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a locally configured BPC audience. It deliberately permits no
+/// whitespace, query, fragment, or control characters so it cannot be
+/// confused with an HTTP request target.
+pub fn is_valid_audience(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_AUDIENCE_LEN
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'/' | b'.' | b'_' | b'-')
+        })
 }

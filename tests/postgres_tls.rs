@@ -21,6 +21,7 @@ fn postgres_tls_connection_uses_verified_chain_and_hostname() -> bpc_protocol::R
             approval_ttl_ms: 60_000,
             schema,
             secret_protector: PostgresSecretProtector::new("tls-test-key-v1", [3; 32])?,
+            require_synchronous_replication: false,
         },
     )?;
     authority.migrate()?;
