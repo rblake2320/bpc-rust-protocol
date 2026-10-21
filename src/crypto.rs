@@ -4,6 +4,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use p256::ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 use crate::authority::canonical_rotation_bytes;
@@ -39,10 +40,12 @@ pub fn body_hash(body: &[u8]) -> String {
 }
 
 /// Derives the BPC request-HMAC key with HKDF-SHA-256.
+///
+/// The server receives only this derived verifier and cannot estimate source
+/// secret entropy, so Rust callers must pass a source secret that satisfies the
+/// BPC policy. Prefer [`generate_registration_secret`] over a human value.
 pub fn derive_request_hmac_key(secret: &str) -> Result<String> {
-    if secret.is_empty() {
-        return Err(BpcError::EmptySecret);
-    }
+    validate_secret(secret)?;
     let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), secret.as_bytes());
     let mut output = [0_u8; 32];
     hkdf.expand(HKDF_INFO, &mut output)
@@ -189,4 +192,19 @@ pub fn validate_secret(secret: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Generates a registration secret with an exact 256-bit OS-random component.
+///
+/// A fixed `Aa0!!` prefix satisfies BPC v1's legacy composition policy without
+/// conditioning the random bytes. This is preferable to human-selected
+/// secrets: rejection sampling a base64url string for character categories
+/// would reduce its entropy below 256 bits. Store the returned value in a
+/// secret manager and expose it only to the intended signing client.
+pub fn generate_registration_secret() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let secret = format!("Aa0!!{}", b64url_encode(bytes));
+    validate_secret(&secret)?;
+    Ok(secret)
 }

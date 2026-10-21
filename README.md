@@ -4,7 +4,7 @@ A hardened Rust implementation of **BPC v1 (Bound Pair Credentials)**: signed HT
 
 The crate is designed for interoperability with the existing BPC TypeScript and Python implementations while offering a production Rust stack for Axum, Redis, and PostgreSQL.
 
-> **Status:** BPC v1 implementation with real Axum, Redis, PostgreSQL, Reqwest, audit-chain, rotation, canary-pair, and cross-language compatibility coverage. Review `SECURITY.md` before production rollout.
+> **Status:** BPC v1 implementation with real Axum, Redis, PostgreSQL, Reqwest, audit-chain, rotation, canary-pair, and cross-language compatibility coverage. Review `SECURITY.md` and the [cryptographic assurance and v2 design](docs/BPC_CRYPTOGRAPHIC_ASSURANCE.md) before production rollout.
 
 ## What it protects
 
@@ -41,17 +41,17 @@ bpc-protocol = { git = "https://github.com/rblake2320/bpc-rust-protocol", featur
 ```rust
 use std::sync::Arc;
 use bpc_protocol::{
-    derive_request_hmac_key, sign_request, BpcKeyPair, BpcRequest, BpcVerifier,
+    derive_request_hmac_key, generate_registration_secret, sign_request, BpcKeyPair, BpcRequest, BpcVerifier,
     MemoryNonceStore, MemoryPairRegistry, PairKind, PairMode, PairRecord, PairStatus, Scope,
 };
 
 let key_pair = BpcKeyPair::generate()?;
-let secret = "A production registration secret belongs in a secret manager";
+let secret = generate_registration_secret()?; // Store only in the client's secret manager.
 let pairs = MemoryPairRegistry::default();
 pairs.insert(PairRecord {
     id: "pair_example".into(), name: "example".into(),
     scope: Scope::ReadWrite, mode: PairMode::Development,
-    request_hmac_key: derive_request_hmac_key(secret)?,
+    request_hmac_key: derive_request_hmac_key(&secret)?,
     public_jwk: key_pair.public_jwk().clone(), status: PairStatus::Active,
     created_at_ms: bpc_protocol::unix_ms()?, expires_at_ms: None, max_requests: None,
     requests: 0, failed_signatures: 0, authorization_version: 1,
@@ -60,7 +60,7 @@ pairs.insert(PairRecord {
 
 let body = br#"{"action":"create"}"#;
 let (_, headers) = sign_request(
-    key_pair.signing_key(), "pair_example", secret, "POST", "/v1/widgets", body,
+    key_pair.signing_key(), "pair_example", &secret, "POST", "/v1/widgets", body,
 )?;
 let decision = BpcVerifier::default().verify(
     BpcRequest {
@@ -74,6 +74,8 @@ let decision = BpcVerifier::default().verify(
 assert!(decision.ok);
 # Ok::<(), bpc_protocol::BpcError>(())
 ```
+
+`generate_registration_secret()` combines a fixed policy-compliant prefix with an unfiltered 256-bit operating-system-random component. Store the returned secret only in the signing client’s secret manager; the server stores a derived verifier key, not the source secret.
 
 The in-memory stores are deliberately limited to one process. Do **not** use them behind multiple replicas.
 

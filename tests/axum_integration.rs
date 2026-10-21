@@ -28,7 +28,7 @@ async fn protected(Extension(snapshot): Extension<AuthSnapshot>, body: String) -
 async fn axum_layer_verifies_raw_bytes_and_restores_the_body() {
     let now = bpc_protocol::unix_ms().unwrap();
     let keypair = BpcKeyPair::generate().unwrap();
-    let secret = "AxumSecret9!@";
+    let secret = "AxumProtocolSecret9!@#";
     let registry = Arc::new(MemoryPairRegistry::default());
     registry
         .insert(PairRecord {
@@ -91,7 +91,7 @@ async fn axum_layer_verifies_raw_bytes_and_restores_the_body() {
 async fn axum_hides_verifier_failure_details_by_default() {
     let now = bpc_protocol::unix_ms().unwrap();
     let keypair = BpcKeyPair::generate().unwrap();
-    let secret = "AxumSecret9!@";
+    let secret = "AxumProtocolSecret9!@#";
     let registry = Arc::new(MemoryPairRegistry::default());
     registry
         .insert(PairRecord {

@@ -59,9 +59,7 @@ impl BpcHttpClient {
             return Err(BpcError::InvalidPayload("invalid BPC pair ID".into()));
         }
         let registration_secret = registration_secret.into();
-        if registration_secret.is_empty() {
-            return Err(BpcError::EmptySecret);
-        }
+        crate::validate_secret(&registration_secret)?;
         let client = Client::builder()
             .redirect(Policy::none())
             .build()
@@ -172,12 +170,13 @@ mod tests {
     use reqwest::Url;
 
     use super::BpcHttpClient;
+    use crate::BpcError;
 
     fn client() -> BpcHttpClient {
         BpcHttpClient::new(
             Url::parse("https://api.example.test/").unwrap(),
             "pair_client",
-            "ClientSecret9!@",
+            "ClientProtocolSecret9!@#",
             SigningKey::random(&mut rand_core::OsRng),
         )
         .unwrap()
@@ -204,5 +203,16 @@ mod tests {
                 .signed_headers("POST", "/v1/widgets?encoded=%2F", b"{}")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn rejects_weak_registration_secret_before_any_request_can_be_signed() {
+        let result = BpcHttpClient::new(
+            Url::parse("https://api.example.test/").unwrap(),
+            "pair_client",
+            "weak",
+            SigningKey::random(&mut rand_core::OsRng),
+        );
+        assert!(matches!(result, Err(BpcError::SecretPolicy(_))));
     }
 }

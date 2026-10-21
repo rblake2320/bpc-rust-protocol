@@ -4,11 +4,11 @@ use std::thread;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bpc_protocol::{
-    AuditAction, AuditEvent, AuditHead, AuditLog, AuditSeverity, BpcKeyPair, BpcRequest,
+    AuditAction, AuditEvent, AuditHead, AuditLog, AuditSeverity, BpcError, BpcKeyPair, BpcRequest,
     BpcVerifier, BpcVerifierConfig, CanaryClass, MemoryAuditLog, MemoryNonceStore,
     MemoryPairAuthority, MemoryPairRegistry, PairKind, PairMode, PairRecord, PairRegistry,
-    PairStatus, Scope, VerificationError, derive_request_hmac_key, sign_request_at,
-    sign_rotation_at, verify_and_rotate_at,
+    PairStatus, Scope, VerificationError, derive_request_hmac_key, generate_registration_secret,
+    sign_request_at, sign_rotation_at, validate_secret, verify_and_rotate_at,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -78,6 +78,39 @@ fn signs_and_verifies_exact_body_and_path() {
     );
     assert!(result.ok, "{result:?}");
     assert_eq!(result.snapshot.unwrap().scope, Scope::Admin);
+}
+
+#[test]
+fn rust_signer_rejects_weak_registration_secret() {
+    let keypair = BpcKeyPair::generate().unwrap();
+    assert!(matches!(
+        derive_request_hmac_key("weak"),
+        Err(BpcError::SecretPolicy(_))
+    ));
+    let result = sign_request_at(
+        keypair.signing_key(),
+        PAIR_ID,
+        "weak",
+        "POST",
+        "/v1/widgets",
+        b"{}",
+        Uuid::new_v4(),
+        NOW,
+    );
+    assert!(matches!(result, Err(BpcError::SecretPolicy(_))));
+}
+
+#[test]
+fn generated_registration_secrets_meet_policy_and_do_not_repeat() {
+    let first = generate_registration_secret().unwrap();
+    let second = generate_registration_secret().unwrap();
+    assert_eq!(first.len(), 48);
+    assert_eq!(second.len(), 48);
+    assert!(first.starts_with("Aa0!!"));
+    assert!(second.starts_with("Aa0!!"));
+    validate_secret(&first).unwrap();
+    validate_secret(&second).unwrap();
+    assert_ne!(first, second);
 }
 
 #[test]

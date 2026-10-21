@@ -152,6 +152,10 @@ impl BpcKeyPair {
     }
 
     /// First 20 base64url characters of SHA-256 over the canonical public JWK.
+    ///
+    /// This 120-bit truncated value is for display and log correlation only;
+    /// it must never be used as an authorization, approval, or key-equality
+    /// identifier.
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
