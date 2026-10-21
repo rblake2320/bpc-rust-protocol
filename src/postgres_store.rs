@@ -4,10 +4,18 @@
 //! approval, rotation, lifecycle transitions, and final successful-use claims
 //! are atomic and version-fenced. Run migrations using a dedicated migration
 //! role; the runtime role should retain only the DML permissions it needs.
+//! Production constructors require TLS, certificate validation, and hostname
+//! validation. Plaintext constructors are available only with the explicit
+//! `postgres-insecure-tests` feature for isolated local testing.
 
 use std::{fmt::Write as _, sync::Mutex};
 
-use postgres::{Client, NoTls, Row, Transaction};
+use native_tls::{Certificate, Protocol, TlsConnector};
+use postgres::{
+    Client, Row, Transaction,
+    config::{Host, SslMode},
+};
+use postgres_native_tls::MakeTlsConnector;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -84,6 +92,45 @@ CREATE INDEX IF NOT EXISTS bpc_audit_pair_idx ON bpc_audit (pair_id, sequence DE
 CREATE INDEX IF NOT EXISTS bpc_audit_time_idx ON bpc_audit (timestamp_ms DESC);
 "#;
 
+/// TLS trust configuration for the PostgreSQL production constructors.
+///
+/// The connector always uses the platform trust store and native TLS's default
+/// certificate and hostname verification. Add the private CA certificate used
+/// by a managed or internal PostgreSQL deployment to
+/// [`additional_root_certificates_pem`](Self::additional_root_certificates_pem).
+/// Each vector must contain one PEM-encoded X.509 CA certificate.
+#[derive(Clone, Debug, Default)]
+pub struct PostgresTlsConfig {
+    /// Private CA certificates in PEM format, in addition to platform roots.
+    pub additional_root_certificates_pem: Vec<Vec<u8>>,
+}
+
+impl PostgresTlsConfig {
+    /// Adds one PEM-encoded private CA certificate to the trusted roots.
+    pub fn with_additional_root_certificate_pem(mut self, certificate: impl Into<Vec<u8>>) -> Self {
+        self.additional_root_certificates_pem
+            .push(certificate.into());
+        self
+    }
+
+    fn build_connector(&self) -> Result<MakeTlsConnector> {
+        let mut builder = TlsConnector::builder();
+        // Keep the secure protocol floor explicit rather than inheriting a
+        // dependency default that could change in a future release.
+        builder.min_protocol_version(Some(Protocol::Tlsv12));
+        for certificate in &self.additional_root_certificates_pem {
+            let certificate = Certificate::from_pem(certificate).map_err(|error| {
+                BpcError::PairRegistry(format!("invalid PostgreSQL TLS root certificate: {error}"))
+            })?;
+            builder.add_root_certificate(certificate);
+        }
+        let connector = builder.build().map_err(|error| {
+            BpcError::PairRegistry(format!("invalid PostgreSQL TLS configuration: {error}"))
+        })?;
+        Ok(MakeTlsConnector::new(connector))
+    }
+}
+
 /// PostgreSQL authority configuration.
 #[derive(Clone, Debug)]
 pub struct PostgresAuthorityConfig {
@@ -123,9 +170,34 @@ pub struct PostgresPairAuthority {
 }
 
 impl PostgresPairAuthority {
-    pub fn connect(url: &str, config: PostgresAuthorityConfig) -> Result<Self> {
+    /// Connects with TLS required plus certificate and hostname verification.
+    ///
+    /// The URL must name one or more TCP hosts. `sslmode=disable` and Unix
+    /// socket targets are rejected; TLS is required even if `sslmode=prefer`
+    /// is omitted or supplied in the URL.
+    pub fn connect_tls(
+        url: &str,
+        config: PostgresAuthorityConfig,
+        tls_config: PostgresTlsConfig,
+    ) -> Result<Self> {
         config.validate()?;
-        let mut client = Client::connect(url, NoTls).map_err(pg_error)?;
+        let client = connect_tls_client(url, &tls_config)?;
+        Self::from_client(client, config)
+    }
+
+    /// Connects without TLS for an isolated local test database.
+    ///
+    /// This API is intentionally unavailable unless the
+    /// `postgres-insecure-tests` feature is enabled. It must never be used in
+    /// a production build.
+    #[cfg(feature = "postgres-insecure-tests")]
+    pub fn connect_insecure_for_tests(url: &str, config: PostgresAuthorityConfig) -> Result<Self> {
+        config.validate()?;
+        let client = Client::connect(url, postgres::NoTls).map_err(pg_error)?;
+        Self::from_client(client, config)
+    }
+
+    fn from_client(mut client: Client, config: PostgresAuthorityConfig) -> Result<Self> {
         set_schema(&mut client, &config.schema)?;
         Ok(Self {
             client: Mutex::new(client),
@@ -440,12 +512,40 @@ pub struct PostgresAuditLog {
 }
 
 impl PostgresAuditLog {
-    pub fn connect(url: &str, schema: impl Into<String>) -> Result<Self> {
+    /// Connects with TLS required plus certificate and hostname verification.
+    ///
+    /// The URL must name one or more TCP hosts. `sslmode=disable` and Unix
+    /// socket targets are rejected; TLS is required even if `sslmode=prefer`
+    /// is omitted or supplied in the URL.
+    pub fn connect_tls(
+        url: &str,
+        schema: impl Into<String>,
+        tls_config: PostgresTlsConfig,
+    ) -> Result<Self> {
         let schema = schema.into();
         if !is_schema_name(&schema) {
             return Err(BpcError::PairRegistry("invalid audit schema name".into()));
         }
-        let mut client = Client::connect(url, NoTls).map_err(pg_error)?;
+        let client = connect_tls_client(url, &tls_config)?;
+        Self::from_client(client, schema)
+    }
+
+    /// Connects without TLS for an isolated local test database.
+    ///
+    /// This API is intentionally unavailable unless the
+    /// `postgres-insecure-tests` feature is enabled. It must never be used in
+    /// a production build.
+    #[cfg(feature = "postgres-insecure-tests")]
+    pub fn connect_insecure_for_tests(url: &str, schema: impl Into<String>) -> Result<Self> {
+        let schema = schema.into();
+        if !is_schema_name(&schema) {
+            return Err(BpcError::PairRegistry("invalid audit schema name".into()));
+        }
+        let client = Client::connect(url, postgres::NoTls).map_err(pg_error)?;
+        Self::from_client(client, schema)
+    }
+
+    fn from_client(mut client: Client, schema: String) -> Result<Self> {
         set_schema(&mut client, &schema)?;
         Ok(Self {
             client: Mutex::new(client),
@@ -644,6 +744,40 @@ fn pg_error(error: postgres::Error) -> BpcError {
     BpcError::PairRegistry(format!("PostgreSQL error: {error}"))
 }
 
+fn connect_tls_client(url: &str, tls_config: &PostgresTlsConfig) -> Result<Client> {
+    let config = tls_connection_config(url)?;
+    let connector = tls_config.build_connector()?;
+    config.connect(connector).map_err(pg_error)
+}
+
+fn tls_connection_config(url: &str) -> Result<postgres::Config> {
+    let mut config = url.parse::<postgres::Config>().map_err(pg_error)?;
+    if config.get_ssl_mode() == SslMode::Disable {
+        return Err(BpcError::PairRegistry(
+            "PostgreSQL TLS connection rejects sslmode=disable".into(),
+        ));
+    }
+    if config.get_hosts().is_empty() {
+        return Err(BpcError::PairRegistry(
+            "PostgreSQL TLS connection requires a TCP hostname for certificate verification".into(),
+        ));
+    }
+    if config
+        .get_hosts()
+        .iter()
+        .any(|host| !matches!(host, Host::Tcp(_)))
+    {
+        return Err(BpcError::PairRegistry(
+            "PostgreSQL TLS connection rejects Unix socket targets because hostname verification is required"
+                .into(),
+        ));
+    }
+    // `postgres` defaults to `prefer`, which can fall back to plaintext. Force
+    // TLS for every production constructor after rejecting explicit disable.
+    config.ssl_mode(SslMode::Require);
+    Ok(config)
+}
+
 fn parse_scope(value: &str) -> Result<Scope> {
     match value {
         "read" => Ok(Scope::Read),
@@ -756,4 +890,50 @@ fn set_schema(client: &mut Client, schema: &str) -> Result<()> {
     client
         .batch_execute(&format!("SET search_path TO {schema}, pg_catalog"))
         .map_err(pg_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_url_rejects_plaintext_and_unverifiable_targets() {
+        let plaintext = tls_connection_config("postgres://user@db.example/bpc?sslmode=disable")
+            .expect_err("sslmode=disable must not reach a production connector");
+        assert!(plaintext.to_string().contains("sslmode=disable"));
+
+        let unix_socket = tls_connection_config("host=/var/run/postgresql dbname=bpc")
+            .expect_err("Unix sockets cannot provide a TLS hostname");
+        assert!(unix_socket.to_string().contains("Unix socket"));
+    }
+
+    #[test]
+    fn tls_url_forces_require_and_rejects_bad_private_roots() {
+        let config = tls_connection_config("postgres://user@db.example/bpc?sslmode=prefer")
+            .expect("a TCP hostname is usable once TLS is made mandatory");
+        assert_eq!(config.get_ssl_mode(), SslMode::Require);
+
+        let result = PostgresTlsConfig::default()
+            .with_additional_root_certificate_pem(b"not a PEM certificate".to_vec())
+            .build_connector();
+        match result {
+            Ok(_) => panic!("malformed private roots must fail before network use"),
+            Err(error) => assert!(error.to_string().contains("TLS root certificate")),
+        }
+    }
+
+    #[test]
+    fn authority_config_rejects_zero_limits_and_invalid_schema() {
+        let zero_limit = PostgresAuthorityConfig {
+            max_active_pairs: 0,
+            ..PostgresAuthorityConfig::default()
+        };
+        assert!(zero_limit.validate().is_err());
+
+        let invalid_schema = PostgresAuthorityConfig {
+            schema: "public; DROP SCHEMA public".into(),
+            ..PostgresAuthorityConfig::default()
+        };
+        assert!(invalid_schema.validate().is_err());
+    }
 }

@@ -1,4 +1,4 @@
-#![cfg(feature = "live-integration")]
+#![cfg(all(feature = "live-integration", feature = "postgres-insecure-tests"))]
 
 use std::env;
 use std::thread;
@@ -53,13 +53,16 @@ fn governed_redis_fails_closed_then_detects_real_replay() {
 fn postgres_authority_and_audit_are_real_transactional_backends() {
     let url = required_env("BPC_TEST_POSTGRES_URL");
     let schema = format!("bpcit_{}", Uuid::new_v4().simple());
+    // This direct provisioning connection is deliberately plaintext only under
+    // the explicit `postgres-insecure-tests` feature. Production constructors
+    // expose `connect_tls` and never fall back to `NoTls`.
     let mut admin = Client::connect(&url, NoTls).unwrap();
     admin
         .batch_execute(&format!("CREATE SCHEMA {schema}"))
         .unwrap();
 
     let result = (|| -> bpc_protocol::Result<()> {
-        let authority = PostgresPairAuthority::connect(
+        let authority = PostgresPairAuthority::connect_insecure_for_tests(
             &url,
             PostgresAuthorityConfig {
                 max_active_pairs: 10,
@@ -123,7 +126,7 @@ fn postgres_authority_and_audit_are_real_transactional_backends() {
             *replacement_key.public_jwk()
         );
 
-        let audit = PostgresAuditLog::connect(&url, &schema)?;
+        let audit = PostgresAuditLog::connect_insecure_for_tests(&url, &schema)?;
         audit.migrate()?;
         audit.append_at(
             AuditEvent {

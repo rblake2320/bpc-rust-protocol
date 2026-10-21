@@ -26,10 +26,11 @@ For a high-assurance deployment, the HMAC factor must originate from `generate_h
 | Core (default) | Canonical BPC v1 payloads, P-256 signing/verification, HKDF/HMAC, strict JWK checks, memory stores for development/tests |
 | `axum` | Exact-body Axum middleware that restores body bytes and injects `AuthSnapshot` only on success |
 | `redis-store` | Governed Redis nonce backend with continuity epoch, fixed horizon, quarantine, `noeviction` enforcement, and fail-closed ambiguity handling |
-| `postgres-store` | Serializable PostgreSQL pair authority, one-time hashed approval tokens, atomic capacity approval/rotation/final claims, and a transactional audit chain |
+| `postgres-store` | TLS-required PostgreSQL pair authority and audit chain with certificate/hostname verification, serializable lifecycle transactions, and one-time hashed approval tokens |
+| `postgres-insecure-tests` | **Test-only:** exposes clearly named `connect_insecure_for_tests` APIs for an isolated local plaintext PostgreSQL service; never enable in production |
 | `reqwest-client` | HTTPS-capable client transport that signs exact transmitted body bytes |
 | `production` | All runtime integrations |
-| `live-integration` | Real Redis/PostgreSQL test gate; requires `BPC_TEST_REDIS_URL` and `BPC_TEST_POSTGRES_URL` |
+| `live-integration` | Real Redis/PostgreSQL test gate; enables `postgres-insecure-tests` and requires `BPC_TEST_REDIS_URL` and `BPC_TEST_POSTGRES_URL` |
 
 ## Install
 
@@ -101,16 +102,22 @@ let request_hmac_key = derive_high_assurance_request_hmac_key(&registration_secr
 Provision schema with a dedicated migration role, then give the runtime role only the narrow DML privileges it needs. `PostgresPairAuthority` uses `SERIALIZABLE` transactions, a transaction advisory lock for capacity decisions, row locks/version fencing, one-way lifecycle transitions, and SHA-256-hashed approval tokens.
 
 ```rust
-use bpc_protocol::{PostgresAuthorityConfig, PostgresPairAuthority};
+use bpc_protocol::{PostgresAuthorityConfig, PostgresPairAuthority, PostgresTlsConfig};
 
-let authority = PostgresPairAuthority::connect(
-    &std::env::var("BPC_DATABASE_URL")?,
+let tls = PostgresTlsConfig::default().with_additional_root_certificate_pem(
+    std::fs::read("/run/secrets/postgres-ca.pem")?,
+);
+let authority = PostgresPairAuthority::connect_tls(
+    &std::env::var("BPC_DATABASE_URL")?, // e.g. postgres://app@db.example/bpc?sslmode=require
     PostgresAuthorityConfig::default(),
+    tls,
 )?;
 authority.migrate()?; // Run during controlled provisioning, not every app start.
 ```
 
-Use TLS in the PostgreSQL URL in production. The database necessarily contains verifier HMAC material; encrypt volumes/backups, apply least privilege, and use a managed/KMS-backed database encryption posture for your environment.
+`connect_tls` always forces TLS 1.2 or newer, certificate verification, and hostname verification. It rejects `sslmode=disable`, Unix-socket URLs, and targets without a hostname. It uses platform trust roots plus any PEM CA certificate added through `PostgresTlsConfig`; use the DNS name present in the database certificate SAN, not an arbitrary load-balancer/IP alias. `PostgresAuditLog::connect_tls` has the same policy. The database necessarily contains verifier HMAC material; encrypt volumes/backups, apply least privilege, and use a managed/KMS-backed database encryption posture for your environment.
+
+For an isolated local plaintext PostgreSQL test service only, enable `postgres-insecure-tests` and call the deliberately named `connect_insecure_for_tests` constructors. The normal `postgres-store` and `production` feature sets do not expose a plaintext connection constructor.
 
 ### 2. Governed Redis replay defense
 
@@ -139,7 +146,7 @@ use std::sync::Arc;
 use axum::{middleware, Router};
 use bpc_protocol::{bpc_axum_middleware, BpcAxumState, BpcVerifier};
 
-# let authority = Arc::new(bpc_protocol::PostgresPairAuthority::connect("postgres://...", bpc_protocol::PostgresAuthorityConfig::default())?);
+# let authority = Arc::new(bpc_protocol::PostgresPairAuthority::connect_tls("postgres://app@db.example/bpc?sslmode=require", bpc_protocol::PostgresAuthorityConfig::default(), bpc_protocol::PostgresTlsConfig::default())?);
 # let nonce_store = Arc::new(bpc_protocol::GovernedRedisNonceStore::connect("redis://...", bpc_protocol::GovernedRedisNonceConfig::new("example", "epoch-1", 60_000)?)?);
 let state = BpcAxumState::new(BpcVerifier::default(), authority, nonce_store);
 let app = Router::new().layer(middleware::from_fn_with_state(state, bpc_axum_middleware));
@@ -193,6 +200,8 @@ Run the full gate locally after setting service URLs:
 
 ```bash
 export BPC_TEST_REDIS_URL='redis://127.0.0.1:6379/'
+# `live-integration` deliberately enables `postgres-insecure-tests`; do not use
+# this URL or feature set for an application build.
 export BPC_TEST_POSTGRES_URL='postgres://postgres:postgres@127.0.0.1:5432/postgres'
 cargo test --all-features --all-targets
 cargo fmt --check

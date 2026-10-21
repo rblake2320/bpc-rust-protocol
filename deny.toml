@@ -1,0 +1,57 @@
+# Release dependency policy. Changes require designated supply-chain review.
+# Exact `skip` entries are reviewed upstream-version splits; any new/different
+# duplicate fails the gate and requires a new explicit review.
+[graph]
+all-features = true
+no-default-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "ISC",
+  "CDLA-Permissive-2.0",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = [
+  { crate = "base64@0.22.1", reason = "P-256/BPC compatibility stack; exact version requires review on change." },
+  { crate = "block-buffer@0.10.4", reason = "P-256/BPC compatibility stack; exact version requires review on change." },
+  { crate = "const-oid@0.9.6", reason = "P-256/BPC compatibility stack; exact version requires review on change." },
+  { crate = "cpufeatures@0.2.17", reason = "P-256/BPC compatibility stack; exact version requires review on change." },
+  { crate = "crypto-common@0.1.6", reason = "P-256/BPC compatibility stack; exact version requires review on change." },
+  { crate = "digest@0.10.7", reason = "P-256/BPC compatibility stack; exact version requires review on change." },
+  { crate = "getrandom@0.2.17", reason = "P-256/BPC compatibility stack; exact version requires review on change." },
+  { crate = "hmac@0.12.1", reason = "BPC cryptography requires Digest 0.10; PostgreSQL uses 0.11." },
+  { crate = "rand_core@0.6.4", reason = "P-256/BPC compatibility stack; exact version requires review on change." },
+  { crate = "sha2@0.10.9", reason = "BPC cryptography requires Digest 0.10; PostgreSQL uses 0.11." },
+  { crate = "syn@2.0.119", reason = "Procedural macro API split in upstream dependencies." },
+  { crate = "wasi@0.11.1+wasi-snapshot-preview1", reason = "Target support split in upstream dependencies." },
+  { crate = "windows-sys@0.52.0", reason = "Target support split in upstream dependencies." },
+]
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []

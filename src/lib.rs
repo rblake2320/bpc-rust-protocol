@@ -101,6 +101,7 @@ pub use redis_store::{GovernedRedisNonceConfig, GovernedRedisNonceStore};
 #[cfg(feature = "postgres-store")]
 pub use postgres_store::{
     POSTGRES_SCHEMA, PostgresAuditLog, PostgresAuthorityConfig, PostgresPairAuthority,
+    PostgresTlsConfig,
 };
 
 #[cfg(feature = "reqwest-client")]

@@ -21,7 +21,10 @@ BPC protects a server from unapproved pair use, request tampering, stale request
 ### PostgreSQL
 
 - Apply `PostgresPairAuthority::migrate()` using a migration/provisioning role, not your normal runtime account.
-- Use a TLS-encrypted PostgreSQL connection and encryption for database volumes, snapshots, and backups. Pair rows hold verifier HMAC material needed for request verification.
+- Use `PostgresPairAuthority::connect_tls` and `PostgresAuditLog::connect_tls`, not a raw PostgreSQL client. These constructors require TLS 1.2 or newer and use certificate plus hostname verification; they reject `sslmode=disable` and Unix-socket targets. Use the database certificate's DNS SAN as the URL host.
+- Configure `PostgresTlsConfig` with the managed/internal database CA PEM where it is not already in the platform trust store. Do not disable certificate or hostname verification.
+- Never enable the `postgres-insecure-tests` feature in an application build. Its deliberately named plaintext constructors exist only for isolated local integration tests.
+- Encrypt database volumes, snapshots, and backups. Pair rows hold verifier HMAC material needed for request verification.
 - Limit runtime privileges to the selected schema/tables. Do not grant DDL, table ownership, or superuser access to the application role.
 - Monitor serialization failures, transaction latency, lock waits, failed approvals, and rejected state-fence claims.
 - Back up and restore-test lifecycle/audit data. Test an application restart and PostgreSQL failover under your real managed-service settings.
