@@ -1,0 +1,17 @@
+.git
+.github
+ci
+.env
+.env.*
+*.log
+target
+fuzz
+security-artifacts
+docs
+examples
+tests
+Dockerfile
+README.md
+SECURITY.md
+LICENSE
+gateway.env.example

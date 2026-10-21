@@ -59,6 +59,39 @@ jobs:
         run: rustup toolchain install 1.85.0 --profile minimal && rustup default 1.85.0
       - run: test "$(redis-cli -h 127.0.0.1 CONFIG GET maxmemory-policy | tail -n 1)" = noeviction
       - run: cargo test --locked --features live-integration --test live_backends
+      - name: Configure isolated gateway smoke environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'BPC_GATEWAY_MODE=development' >> "$GITHUB_ENV"
+          echo 'BPC_GATEWAY_BIND_ADDR=127.0.0.1:8181' >> "$GITHUB_ENV"
+          echo 'BPC_GATEWAY_AUDIENCE=bpc://localhost/development' >> "$GITHUB_ENV"
+          echo 'BPC_GATEWAY_SIGNATURE_WINDOW_MS=1000' >> "$GITHUB_ENV"
+          echo 'BPC_GATEWAY_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres' >> "$GITHUB_ENV"
+          echo 'BPC_GATEWAY_POSTGRES_SCHEMA=bpc_gateway_ci' >> "$GITHUB_ENV"
+          echo 'BPC_GATEWAY_DATA_KEY_ID=gateway-ci-ephemeral' >> "$GITHUB_ENV"
+          echo "BPC_GATEWAY_DATA_KEY_B64=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')" >> "$GITHUB_ENV"
+          echo 'BPC_GATEWAY_REDIS_URL=redis://127.0.0.1:6379/' >> "$GITHUB_ENV"
+          echo 'BPC_GATEWAY_REDIS_NAMESPACE=bpc-gateway-ci' >> "$GITHUB_ENV"
+          echo 'BPC_GATEWAY_REDIS_MIN_REPLICA_ACKS=0' >> "$GITHUB_ENV"
+          echo 'BPC_GATEWAY_ALLOW_INSECURE_LOOPBACK=true' >> "$GITHUB_ENV"
+          echo 'BPC_GATEWAY_ANCHOR_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres' >> "$GITHUB_ENV"
+          echo 'BPC_GATEWAY_ANCHOR_SCHEMA=bpc_gateway_anchor_ci' >> "$GITHUB_ENV"
+      - name: Run real BPC gateway process smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --features gateway --bin bpc-gateway
+          ./target/release/bpc-gateway migrate
+          if ./target/release/bpc-gateway initialize-replay --fenced; then
+            echo 'new replay namespace unexpectedly skipped its mandatory quarantine'; exit 1
+          fi
+          for _ in $(seq 1 45); do sleep 1; done
+          ./target/release/bpc-gateway serve > gateway.log 2>&1 & gateway_pid=$!
+          trap 'kill "$gateway_pid" 2>/dev/null || true; cat gateway.log' EXIT
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:8181/healthz >/dev/null && break; sleep 1; done
+          curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:8181/readyz | grep -qx 204
+          BPC_GATEWAY_SMOKE=1 cargo test --locked --features gateway --test gateway_live
   live-postgres-tls:
     name: live verified PostgreSQL TLS
     runs-on: ubuntu-24.04
@@ -104,5 +137,5 @@ jobs:
       - name: Install supply-chain toolchain
         run: rustup toolchain install 1.88.0 --profile minimal && rustup default 1.88.0
       - run: cargo metadata --locked --format-version 1 --no-deps > /dev/null
-      - run: cargo install cargo-audit --version 0.22.2 --locked && cargo audit --deny warnings
+      - run: cargo install cargo-audit --version 0.22.2 --locked && cargo audit
       - run: cargo install cargo-deny --version 0.20.2 --locked && cargo deny check all

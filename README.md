@@ -69,6 +69,10 @@ assert!(decision.ok);
 
 ## Production deployment
 
+### Runnable gateway product
+
+Build `bpc-gateway` with `cargo build --locked --release --features gateway --bin bpc-gateway`. It provides liveness/readiness endpoints, an authenticated reference route, durable offline enrollment/approval/revocation commands, and a PostgreSQL-backed independent Redis-continuity anchor. It starts closed until the replay generation has been explicitly provisioned after fencing and its quarantine has elapsed. See the [gateway operations guide](docs/GATEWAY_OPERATIONS.md) and [configuration template](gateway.env.example).
+
 ### PostgreSQL authority
 
 Use `PostgresPairAuthority::connect_tls` with `sslmode=verify-full`, a trusted CA, a hostname-matching certificate, least-privilege runtime credentials, and `PostgresAuthorityConfig::new` (which requires synchronous `remote_apply` replication). `migrate()` labels pre-v2 active records as `v1-compatibility` and discards unapproved old pending records; the v2 verifier rejects those legacy records. Existing clients must be re-enrolled with a new key pair and random registration secret.
@@ -107,7 +111,7 @@ cargo deny check all
 node scripts/verify-node-interop.mjs
 ```
 
-Read [SECURITY.md](SECURITY.md), [production release gates](docs/PRODUCTION_RELEASE_GATES.md), [cryptographic assurance](docs/BPC_CRYPTOGRAPHIC_ASSURANCE.md), and the [peer review package](docs/PEER_REVIEW.md) before describing a deployment as production ready.
+Read [SECURITY.md](SECURITY.md), [production release gates](docs/PRODUCTION_RELEASE_GATES.md), [cryptographic assurance](docs/BPC_CRYPTOGRAPHIC_ASSURANCE.md), [gateway operations](docs/GATEWAY_OPERATIONS.md), and the [peer review package](docs/PEER_REVIEW_V2.md) before describing a deployment as production ready.
 
 ## BPC–TSK composition
 
