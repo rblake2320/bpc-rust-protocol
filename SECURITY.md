@@ -34,8 +34,8 @@ BPC protects a server from unapproved pair use, request tampering, stale request
 - `GovernedRedisNonceStore` requires `rediss://` by default. Plain `redis://` is only available after the explicit `allow_insecure_loopback` test/development opt-in and only for literal loopback hosts. Also require ACL authentication, dedicated tenancy/database, bounded client queues, and `maxmemory-policy noeviction`.
 - Leave `min_replica_acks` at its secure default (`1`) for production. Redis must acknowledge each fresh nonce write to the configured replica quorum before it can authorize. The replay backend separately checks the signed timestamp against Redis server time.
 - Allow the service principal to read `CONFIG GET maxmemory-policy` or provide an equivalent controlled preflight; failure to prove no-eviction must keep authorization closed.
-- Call `provision_epoch` and then `reconcile` before accepting traffic. New/mismatched epochs intentionally quarantine for the configured replay retention horizon.
-- Reconcile on a serialized periodic cadence shorter than nonce retention and after any connectivity, failover, restore, snapshot, or configuration incident.
+- Redis cannot prove its own nonce history. Use an independently durable, monotonic `RedisContinuityAnchor` outside Redis's backup/restore domain. After fencing/draining verifiers for any restore, promotion, replacement, or persistence uncertainty, advance the anchor, call `provision_current_generation`, wait its full quarantine, then call `reconcile` before accepting traffic.
+- Reconcile on a serialized periodic cadence shorter than nonce retention and after any connectivity, failover, restore, snapshot, or configuration incident. A static deployment epoch is not a continuity proof.
 - Alert on quarantine state, continuity mismatch, Redis command failures/timeouts, replay rate, and memory pressure. A timeout is an ambiguous nonce outcome and must remain fail-closed.
 
 ### HTTP integration
@@ -56,7 +56,7 @@ BPC protects a server from unapproved pair use, request tampering, stale request
 
 ## Security-sensitive behavior guaranteed by this crate
 
-- Strict payload shape and exact canonical JSON before signature verification.
+- Strict BPC v2 payload shape and exact canonical JSON before signature verification; both factors bind audience, mode, pair ID, purpose, method, exact path, body digest, nonce, timestamp, and version.
 - Strict P-256 public point, base64url, UUID-v4 nonce, safe integer, method/scope, and exact-body validation.
 - Constant-time HMAC comparison through the RustCrypto `Mac::verify_slice` primitive.
 - Fixed-width P1363 signature validation.
@@ -68,9 +68,9 @@ BPC protects a server from unapproved pair use, request tampering, stale request
 - Rotation atomically retires the old pair and inserts the replacement; predecessor revocation traverses successor lineage.
 - The supplied Axum adapter defaults to generic public denials, performs declared-size preflight, bounds and times out body buffering, and prevents timed-out blocking verification work from bypassing its concurrency limit.
 - The supplied Reqwest transport pins one origin, rejects authority/path normalization forms before signing, never follows redirects carrying BPC headers, and has bounded connect/total/read timeouts.
-- PostgreSQL pair verifier material and pending enrollment records are AES-256-GCM envelopes bound to their exact pair/token context.
+- PostgreSQL pair verifier material and pending enrollment records are AES-256-GCM envelopes bound to their exact pair/token context. Public pair/enrollment domain types are non-serializable and redact verifier material from debug output.
 - Audit verification has a fixed maximum work bound and PostgreSQL audit verification compares the chain to its persisted head inside a repeatable-read snapshot.
 
 ## Versioning changes
 
-Changes that alter canonical payload bytes, signature encoding, nonce semantics, signed path form, JWK acceptance rules, or error-code meanings require a new protocol version. Do not silently relax or tighten those behaviors in a v1 deployment without cross-language test vectors and a migration plan.
+Changes that alter canonical payload bytes, signature encoding, nonce semantics, signed path form, JWK acceptance rules, or error-code meanings require a new protocol version. BPC v1 must not be accepted as a fallback after a BPC v2 failure; migrate with fresh BPC v2 enrollment and cross-language test vectors.

@@ -5,11 +5,12 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bpc_protocol::{
     AuditAction, AuditEvent, AuditHead, AuditLog, AuditSeverity, BpcError, BpcKeyPair, BpcRequest,
-    BpcVerifier, BpcVerifierConfig, CanaryClass, MemoryAuditLog, MemoryNonceStore,
-    MemoryPairAuthority, MemoryPairRegistry, PairAuthority, PairKind, PairMode, PairRecord,
-    PairRegistration, PairRegistry, PairStatus, Scope, VerificationError, derive_request_hmac_key,
-    generate_registration_secret, sign_request_at, sign_rotation_at, validate_secret,
-    verify_and_rotate_at,
+    BpcSigningContext, BpcVerifier, BpcVerifierConfig, CanaryClass, MemoryAuditLog,
+    MemoryNonceStore, MemoryPairAuthority, MemoryPairRegistry, PairAuthority, PairKind, PairMode,
+    PairRecord, PairRegistration, PairRegistry, PairRequestProtocol, PairStatus, Scope,
+    SuccessClaim, VerificationError, canonical_payload_bytes, derive_request_hmac_key,
+    generate_registration_secret, sign_payload, sign_request_at, sign_rotation_at, validate_secret,
+    verify_and_rotate_at, verify_request_hmac,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -17,6 +18,37 @@ use uuid::Uuid;
 const NOW: u64 = 1_740_000_000_000;
 const SECRET: &str = "ExampleSecret9!@";
 const PAIR_ID: &str = "pair_protocol";
+
+fn context() -> BpcSigningContext {
+    BpcSigningContext::new("bpc://localhost/development", PairMode::Development).unwrap()
+}
+
+struct FinalizationRegistry {
+    pair: PairRecord,
+    unavailable: bool,
+}
+
+impl PairRegistry for FinalizationRegistry {
+    fn get(&self, _pair_id: &str) -> bpc_protocol::Result<Option<PairRecord>> {
+        Ok(Some(self.pair.clone()))
+    }
+    fn record_failure(&self, _pair_id: &str, _lockout_after: u32) -> bpc_protocol::Result<()> {
+        Ok(())
+    }
+    fn claim_success(
+        &self,
+        _expected: &PairRecord,
+        _now_ms: u64,
+    ) -> bpc_protocol::Result<SuccessClaim> {
+        if self.unavailable {
+            Err(BpcError::PairRegistry(
+                "injected finalization outage".into(),
+            ))
+        } else {
+            Ok(SuccessClaim::StateChanged)
+        }
+    }
+}
 
 fn setup(kind: PairKind) -> (Arc<MemoryPairRegistry>, BpcKeyPair, MemoryNonceStore) {
     let registry = Arc::new(MemoryPairRegistry::default());
@@ -29,6 +61,7 @@ fn setup(kind: PairKind) -> (Arc<MemoryPairRegistry>, BpcKeyPair, MemoryNonceSto
             mode: PairMode::Development,
             audience: "bpc://localhost/development".into(),
             request_hmac_key: derive_request_hmac_key(SECRET).unwrap(),
+            request_protocol: PairRequestProtocol::V2,
             public_jwk: keypair.public_jwk().clone(),
             status: PairStatus::Active,
             created_at_ms: NOW,
@@ -51,6 +84,7 @@ fn signed_request(keypair: &BpcKeyPair) -> (Vec<u8>, bpc_protocol::SignedHeaders
         keypair.signing_key(),
         PAIR_ID,
         SECRET,
+        &context(),
         "POST",
         "/v1/widgets?from=test",
         &body,
@@ -67,6 +101,7 @@ fn signs_and_verifies_exact_body_and_path() {
     let (body, headers) = signed_request(&keypair);
     let result = BpcVerifier::default().verify_at(
         BpcRequest {
+            hmac: &headers.hmac,
             pair_id: &headers.pair_id,
             signature: &headers.signature,
             signed_data: &headers.signed_data,
@@ -92,6 +127,7 @@ fn verifier_rejects_untrusted_audience_and_out_of_policy_freshness_windows() {
     );
     let denied = production.verify_at(
         BpcRequest {
+            hmac: &headers.hmac,
             pair_id: &headers.pair_id,
             signature: &headers.signature,
             signed_data: &headers.signed_data,
@@ -131,6 +167,7 @@ fn nonce_identity_is_scoped_to_pair_but_still_rejects_each_pairs_replay() {
             mode: PairMode::Development,
             audience: "bpc://localhost/development".into(),
             request_hmac_key: derive_request_hmac_key("SecondProtocolSecret9!@#").unwrap(),
+            request_protocol: PairRequestProtocol::V2,
             public_jwk: second_key.public_jwk().clone(),
             status: PairStatus::Active,
             created_at_ms: NOW,
@@ -150,6 +187,7 @@ fn nonce_identity_is_scoped_to_pair_but_still_rejects_each_pairs_replay() {
         first_key.signing_key(),
         PAIR_ID,
         SECRET,
+        &context(),
         "POST",
         "/v1/widgets?from=test",
         body,
@@ -161,6 +199,7 @@ fn nonce_identity_is_scoped_to_pair_but_still_rejects_each_pairs_replay() {
         second_key.signing_key(),
         "pair_second",
         "SecondProtocolSecret9!@#",
+        &context(),
         "POST",
         "/v1/widgets?from=test",
         body,
@@ -174,6 +213,7 @@ fn nonce_identity_is_scoped_to_pair_but_still_rejects_each_pairs_replay() {
             verifier
                 .verify_at(
                     BpcRequest {
+                        hmac: &headers.hmac,
                         pair_id: &headers.pair_id,
                         signature: &headers.signature,
                         signed_data: &headers.signed_data,
@@ -194,6 +234,7 @@ fn nonce_identity_is_scoped_to_pair_but_still_rejects_each_pairs_replay() {
             verifier
                 .verify_at(
                     BpcRequest {
+                        hmac: &headers.hmac,
                         pair_id: &headers.pair_id,
                         signature: &headers.signature,
                         signed_data: &headers.signed_data,
@@ -223,6 +264,7 @@ fn rust_signer_rejects_weak_registration_secret() {
         keypair.signing_key(),
         PAIR_ID,
         "weak",
+        &context(),
         "POST",
         "/v1/widgets",
         b"{}",
@@ -254,6 +296,7 @@ fn a_forged_signature_does_not_burn_the_nonce() {
     let verifier = BpcVerifier::default();
     let first = verifier.verify_at(
         BpcRequest {
+            hmac: &forged.hmac,
             pair_id: &forged.pair_id,
             signature: &forged.signature,
             signed_data: &forged.signed_data,
@@ -269,6 +312,7 @@ fn a_forged_signature_does_not_burn_the_nonce() {
     assert_eq!(first.error, Some(VerificationError::InvalidSignature));
     let valid = verifier.verify_at(
         BpcRequest {
+            hmac: &headers.hmac,
             pair_id: &headers.pair_id,
             signature: &headers.signature,
             signed_data: &headers.signed_data,
@@ -291,6 +335,7 @@ fn pair_id_only_junk_cannot_lock_a_credential() {
     for _ in 0..20 {
         let denied = verifier.verify_at(
             BpcRequest {
+                hmac: "x",
                 pair_id: PAIR_ID,
                 signature: "not-a-signature",
                 signed_data: "not-base64url-json",
@@ -320,6 +365,7 @@ fn replayed_valid_hmac_with_invalid_signatures_cannot_lock_a_credential() {
     for _ in 0..2 {
         let denied = verifier.verify_at(
             BpcRequest {
+                hmac: &forged.hmac,
                 pair_id: &forged.pair_id,
                 signature: &forged.signature,
                 signed_data: &forged.signed_data,
@@ -351,6 +397,7 @@ fn all_invalid_signatures_leave_credential_state_unchanged() {
             verifier
                 .verify_at(
                     BpcRequest {
+                        hmac: &forged.hmac,
                         pair_id: &forged.pair_id,
                         signature: &forged.signature,
                         signed_data: &forged.signed_data,
@@ -387,6 +434,7 @@ fn exactly_one_of_many_concurrent_replays_is_authorized() {
             thread::spawn(move || {
                 BpcVerifier::default().verify_at(
                     BpcRequest {
+                        hmac: &headers.hmac,
                         pair_id: &headers.pair_id,
                         signature: &headers.signature,
                         signed_data: &headers.signed_data,
@@ -423,6 +471,7 @@ fn verified_ghost_pair_is_never_authorized_and_its_nonce_is_spent() {
     let verifier = BpcVerifier::default();
     let first = verifier.verify_at(
         BpcRequest {
+            hmac: &headers.hmac,
             pair_id: &headers.pair_id,
             signature: &headers.signature,
             signed_data: &headers.signed_data,
@@ -438,6 +487,7 @@ fn verified_ghost_pair_is_never_authorized_and_its_nonce_is_spent() {
     assert_eq!(first.error, Some(VerificationError::GhostPairDenied));
     let replay = verifier.verify_at(
         BpcRequest {
+            hmac: &headers.hmac,
             pair_id: &headers.pair_id,
             signature: &headers.signature,
             signed_data: &headers.signed_data,
@@ -552,10 +602,11 @@ struct NodeFixture {
 #[test]
 fn accepts_node_webcrypto_p1363_request_fixture() {
     let fixture: NodeFixture =
-        serde_json::from_str(include_str!("fixtures/node-webcrypto-v1.json")).unwrap();
+        serde_json::from_str(include_str!("fixtures/node-webcrypto-v2.json")).unwrap();
     assert_eq!(
         derive_request_hmac_key(&fixture.registration_secret).unwrap(),
-        fixture.request_hmac_key
+        bpc_protocol::SecretRequestHmacKey::from_base64url(fixture.request_hmac_key.clone())
+            .unwrap()
     );
     let body = URL_SAFE_NO_PAD.decode(fixture.body_base64url).unwrap();
     let registry = MemoryPairRegistry::default();
@@ -566,7 +617,11 @@ fn accepts_node_webcrypto_p1363_request_fixture() {
             scope: Scope::ReadWrite,
             mode: PairMode::Production,
             audience: "bpc://api.example.test/production".into(),
-            request_hmac_key: fixture.request_hmac_key,
+            request_hmac_key: bpc_protocol::SecretRequestHmacKey::from_base64url(
+                fixture.request_hmac_key,
+            )
+            .unwrap(),
+            request_protocol: PairRequestProtocol::V2,
             public_jwk: fixture.public_jwk,
             status: PairStatus::Active,
             created_at_ms: NOW,
@@ -585,6 +640,7 @@ fn accepts_node_webcrypto_p1363_request_fixture() {
     );
     let result = verifier.verify_at(
         BpcRequest {
+            hmac: &fixture.headers.hmac,
             pair_id: &fixture.headers.pair_id,
             signature: &fixture.headers.signature,
             signed_data: &fixture.headers.signed_data,
@@ -611,6 +667,7 @@ fn expired_pairs_are_transitioned_before_memory_capacity_is_checked() {
         mode: PairMode::Development,
         audience: "bpc://localhost/development".into(),
         request_hmac_key: derive_request_hmac_key(SECRET).unwrap(),
+        request_protocol: PairRequestProtocol::V2,
         public_jwk: first_key.public_jwk().clone(),
         expires_at_ms: Some(NOW),
         max_requests: None,
@@ -626,6 +683,7 @@ fn expired_pairs_are_transitioned_before_memory_capacity_is_checked() {
         mode: PairMode::Development,
         audience: "bpc://localhost/development".into(),
         request_hmac_key: derive_request_hmac_key("SecondCapacitySecret9!@#").unwrap(),
+        request_protocol: PairRequestProtocol::V2,
         public_jwk: second_key.public_jwk().clone(),
         expires_at_ms: None,
         max_requests: None,
@@ -642,4 +700,118 @@ fn expired_pairs_are_transitioned_before_memory_capacity_is_checked() {
         registry.get(&second_id).unwrap().unwrap().status,
         PairStatus::Active
     );
+}
+
+#[test]
+fn v2_hmac_binds_every_request_core_field_and_blocks_a_signature_key_transplant() {
+    let (registry, keypair, nonces) = setup(PairKind::Legitimate);
+    let body = br#"{"widget":"bpc"}"#.to_vec();
+    let (payload, captured) = sign_request_at(
+        keypair.signing_key(),
+        PAIR_ID,
+        SECRET,
+        &context(),
+        "POST",
+        "/v1/widgets?from=test",
+        &body,
+        Uuid::parse_str("a8098c1a-f86e-4aef-9f0f-80e4b6c6c6c6").unwrap(),
+        NOW,
+    )
+    .unwrap();
+    let verifier_key = derive_request_hmac_key(SECRET).unwrap();
+    let mut altered = Vec::new();
+    for change in 0..8 {
+        let mut core = payload.clone();
+        match change {
+            0 => core.audience = "bpc://localhost/other".into(),
+            1 => core.body_hash = bpc_protocol::body_hash(b"altered"),
+            2 => core.method = "PUT".into(),
+            3 => core.mode = PairMode::Production,
+            4 => core.nonce = "03d8cf96-ab7c-4727-b4e1-6a9309efb312".into(),
+            5 => core.pair_id = "pair_other".into(),
+            6 => core.path = "/v1/other".into(),
+            _ => core.timestamp += 1,
+        }
+        altered.push(core);
+    }
+    for core in altered {
+        let canonical = canonical_payload_bytes(&core).unwrap();
+        assert!(!verify_request_hmac(
+            &verifier_key,
+            &canonical,
+            &captured.hmac
+        ));
+        // A P-256 signing-key compromise cannot transplant a captured v2 HMAC.
+        let forged_signature = sign_payload(keypair.signing_key(), &core, &captured.hmac).unwrap();
+        let result = BpcVerifier::default().verify_at(
+            BpcRequest {
+                hmac: &captured.hmac,
+                pair_id: &captured.pair_id,
+                signature: &forged_signature,
+                signed_data: &bpc_protocol::b64url_encode(&canonical),
+                version: "2.0",
+                method: "POST",
+                path: "/v1/widgets?from=test",
+                body: &body,
+            },
+            registry.as_ref(),
+            &nonces,
+            NOW,
+        );
+        assert_eq!(result.error, Some(VerificationError::InvalidSecretHmac));
+    }
+}
+
+#[test]
+fn v2_is_closed_to_downgrade_and_pair_debug_output_redacts_verifier_material() {
+    let (registry, keypair, nonces) = setup(PairKind::Legitimate);
+    let (body, headers) = signed_request(&keypair);
+    let downgrade = BpcVerifier::default().verify_at(
+        BpcRequest {
+            hmac: &headers.hmac,
+            pair_id: &headers.pair_id,
+            signature: &headers.signature,
+            signed_data: &headers.signed_data,
+            version: "1.0",
+            method: "POST",
+            path: "/v1/widgets?from=test",
+            body: &body,
+        },
+        registry.as_ref(),
+        &nonces,
+        NOW,
+    );
+    assert_eq!(downgrade.error, Some(VerificationError::VersionMismatch));
+    let debug = format!("{:?}", registry.get(PAIR_ID).unwrap().unwrap());
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains("ExampleSecret9!@"));
+}
+
+#[test]
+fn spent_nonce_finalization_outcomes_are_not_retryable() {
+    for (unavailable, expected) in [
+        (false, VerificationError::PairStateChanged),
+        (true, VerificationError::PairFinalizationUnavailable),
+    ] {
+        let (source, keypair, nonces) = setup(PairKind::Legitimate);
+        let pair = source.get(PAIR_ID).unwrap().unwrap();
+        let registry = FinalizationRegistry { pair, unavailable };
+        let (body, headers) = signed_request(&keypair);
+        let request = BpcRequest {
+            hmac: &headers.hmac,
+            pair_id: &headers.pair_id,
+            signature: &headers.signature,
+            signed_data: &headers.signed_data,
+            version: &headers.version,
+            method: "POST",
+            path: "/v1/widgets?from=test",
+            body: &body,
+        };
+        let first = BpcVerifier::default().verify_at(request, &registry, &nonces, NOW);
+        assert_eq!(first.error, Some(expected));
+        assert_eq!(first.error.unwrap().code(), expected.code());
+        assert_eq!(nonces.len().unwrap(), 1);
+        let replay = BpcVerifier::default().verify_at(request, &registry, &nonces, NOW);
+        assert_eq!(replay.error, Some(VerificationError::ReplayDetected));
+    }
 }

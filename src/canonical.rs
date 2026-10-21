@@ -1,16 +1,22 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::Value;
+use uuid::{Uuid, Variant, Version};
 
-use crate::{BPC_PROTOCOL_VERSION, BpcError, BpcPayload, MAX_JS_SAFE_INTEGER, Result};
+use crate::{
+    BPC_V2_PROTOCOL_VERSION, BpcError, BpcPayload, MAX_JS_SAFE_INTEGER, Result, body_hash,
+    is_valid_audience, is_valid_pair_id,
+};
 
-const REQUIRED_FIELDS: [&str; 8] = [
+const REQUIRED_FIELDS: [&str; 10] = [
+    "audience",
     "body_hash",
     "method",
+    "mode",
     "nonce",
     "pair_id",
     "path",
-    "secret_hmac",
+    "purpose",
     "timestamp",
     "version",
 ];
@@ -24,22 +30,19 @@ const FORBIDDEN_KEYS: [&str; 7] = [
     "__lookupSetter__",
 ];
 
-/// Serializes a BPC request payload in the required alphabetical, compact JSON form.
+/// Serializes a BPC v2 request core in exact alphabetical compact JSON form.
 pub fn canonical_payload_bytes(payload: &BpcPayload) -> Result<Vec<u8>> {
+    validate_payload_shape(payload)?;
     Ok(serde_json::to_vec(payload)?)
 }
 
-/// Serializes a BPC request payload in the required alphabetical, compact JSON form.
+/// Serializes a BPC v2 request core in exact alphabetical compact JSON form.
 pub fn canonical_payload(payload: &BpcPayload) -> Result<String> {
     String::from_utf8(canonical_payload_bytes(payload)?)
         .map_err(|_| BpcError::InvalidPayload("canonical JSON was not UTF-8".into()))
 }
 
-/// Decodes, structurally validates, and requires byte-for-byte canonical BPC JSON.
-///
-/// Requiring the encoded payload to equal its canonical re-serialization rejects
-/// duplicate keys, whitespace variants, alternate escaping, and reordered fields
-/// before cryptographic verification.
+/// Decodes, structurally validates, and requires byte-for-byte canonical BPC v2 JSON.
 pub fn parse_canonical_payload(signed_data: &str) -> Result<(BpcPayload, Vec<u8>)> {
     if signed_data.is_empty() || signed_data.len() > 4096 || !signed_data.bytes().all(is_b64url) {
         return Err(BpcError::InvalidPayload(
@@ -51,8 +54,6 @@ pub fn parse_canonical_payload(signed_data: &str) -> Result<(BpcPayload, Vec<u8>
         .map_err(|_| BpcError::InvalidBase64)?;
     let text = std::str::from_utf8(&raw)
         .map_err(|_| BpcError::InvalidPayload("payload is not UTF-8 JSON".into()))?;
-
-    // This raw-string scan is defense in depth; exact-key validation below is authoritative.
     if FORBIDDEN_KEYS
         .iter()
         .any(|key| text.contains(&format!("\"{key}\"")))
@@ -61,7 +62,6 @@ pub fn parse_canonical_payload(signed_data: &str) -> Result<(BpcPayload, Vec<u8>
             "payload contains a forbidden object key".into(),
         ));
     }
-
     let value: Value = serde_json::from_slice(&raw)?;
     let object = value
         .as_object()
@@ -72,7 +72,7 @@ pub fn parse_canonical_payload(signed_data: &str) -> Result<(BpcPayload, Vec<u8>
             .any(|field| !object.contains_key(*field))
     {
         return Err(BpcError::InvalidPayload(
-            "payload must contain exactly the eight BPC v1 fields".into(),
+            "payload must contain exactly the ten BPC v2 fields".into(),
         ));
     }
     if object.iter().any(|(key, value)| {
@@ -82,10 +82,9 @@ pub fn parse_canonical_payload(signed_data: &str) -> Result<(BpcPayload, Vec<u8>
             "payload must be flat and cannot contain forbidden keys".into(),
         ));
     }
-
     let payload: BpcPayload = serde_json::from_value(value)?;
     validate_payload_shape(&payload)?;
-    let canonical = canonical_payload_bytes(&payload)?;
+    let canonical = serde_json::to_vec(&payload)?;
     if raw != canonical {
         return Err(BpcError::InvalidPayload(
             "payload is not exactly canonical JSON".into(),
@@ -94,29 +93,62 @@ pub fn parse_canonical_payload(signed_data: &str) -> Result<(BpcPayload, Vec<u8>
     Ok((payload, raw))
 }
 
-/// Performs field-level validation independent of a particular HTTP request.
+/// Validates fields that are independent of the received HTTP request.
 pub fn validate_payload_shape(payload: &BpcPayload) -> Result<()> {
-    if payload.version != BPC_PROTOCOL_VERSION {
+    if payload.version != BPC_V2_PROTOCOL_VERSION || payload.purpose != "http-request" {
         return Err(BpcError::InvalidPayload(
-            "unsupported payload version".into(),
+            "unsupported BPC v2 payload purpose or version".into(),
         ));
     }
-    if payload.timestamp > MAX_JS_SAFE_INTEGER {
+    if payload.timestamp > MAX_JS_SAFE_INTEGER
+        || !is_valid_audience(&payload.audience)
+        || !is_valid_pair_id(&payload.pair_id)
+        || !is_allowed_method(&payload.method)
+        || !is_safe_path(&payload.path)
+    {
         return Err(BpcError::InvalidPayload(
-            "timestamp must be a JavaScript-safe integer".into(),
+            "BPC v2 core fields are invalid".into(),
         ));
     }
-    if payload.method.is_empty() || payload.path.is_empty() || payload.pair_id.is_empty() {
+    let nonce = Uuid::parse_str(&payload.nonce)
+        .map_err(|_| BpcError::InvalidPayload("BPC nonce is invalid".into()))?;
+    if nonce.get_version() != Some(Version::Random)
+        || nonce.get_variant() != Variant::RFC4122
+        || nonce.to_string() != payload.nonce
+    {
         return Err(BpcError::InvalidPayload(
-            "method, path, and pair ID must be non-empty".into(),
+            "BPC nonce must be canonical UUID v4".into(),
         ));
     }
-    if payload.body_hash.is_empty() || payload.secret_hmac.is_empty() {
-        return Err(BpcError::InvalidPayload(
-            "body hash and secret HMAC must be non-empty".into(),
-        ));
+    if !is_body_hash(&payload.body_hash) {
+        return Err(BpcError::InvalidPayload("BPC body hash is invalid".into()));
     }
     Ok(())
+}
+
+/// Compares a computed body hash to a v2 core with a fixed, strict encoding form.
+pub fn body_hash_matches(payload: &BpcPayload, body: &[u8]) -> bool {
+    payload.body_hash == body_hash(body)
+}
+
+fn is_body_hash(value: &str) -> bool {
+    value.len() == 50
+        && value.starts_with("sha256:")
+        && value.as_bytes()[7..].iter().all(|byte| is_b64url(*byte))
+}
+
+fn is_safe_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains(['\\', '#', '\r', '\n'])
+}
+
+fn is_allowed_method(method: &str) -> bool {
+    matches!(
+        method,
+        "GET" | "HEAD" | "OPTIONS" | "POST" | "PUT" | "PATCH" | "DELETE"
+    )
 }
 
 fn is_b64url(byte: u8) -> bool {

@@ -10,8 +10,9 @@ use axum::http::{Method, StatusCode};
 use axum::middleware;
 use axum::routing::post;
 use bpc_protocol::{
-    AuthSnapshot, BpcAxumState, BpcKeyPair, BpcVerifier, MemoryNonceStore, MemoryPairRegistry,
-    PairKind, PairMode, PairRecord, PairStatus, Scope, derive_request_hmac_key, sign_request_at,
+    AuthSnapshot, BpcAxumState, BpcKeyPair, BpcSigningContext, BpcVerifier, MemoryNonceStore,
+    MemoryPairRegistry, PairKind, PairMode, PairRecord, PairRequestProtocol, PairStatus, Scope,
+    derive_request_hmac_key, sign_request_at,
 };
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -39,6 +40,7 @@ async fn axum_layer_verifies_raw_bytes_and_restores_the_body() {
             mode: PairMode::Development,
             audience: "bpc://localhost/development".into(),
             request_hmac_key: derive_request_hmac_key(secret).unwrap(),
+            request_protocol: PairRequestProtocol::V2,
             public_jwk: keypair.public_jwk().clone(),
             status: PairStatus::Active,
             created_at_ms: now,
@@ -66,6 +68,7 @@ async fn axum_layer_verifies_raw_bytes_and_restores_the_body() {
         keypair.signing_key(),
         "pair_axum",
         secret,
+        &BpcSigningContext::new("bpc://localhost/development", PairMode::Development).unwrap(),
         "POST",
         "/v1/widgets?via=axum",
         body,
@@ -76,6 +79,7 @@ async fn axum_layer_verifies_raw_bytes_and_restores_the_body() {
     let request = Request::builder()
         .method(Method::POST)
         .uri("/v1/widgets?via=axum")
+        .header("X-BPC-HMAC", headers.hmac)
         .header("X-BPC-Pair-ID", headers.pair_id)
         .header("X-BPC-Signature", headers.signature)
         .header("X-BPC-Signed-Data", headers.signed_data)
@@ -104,6 +108,7 @@ async fn axum_hides_verifier_failure_details_by_default() {
             mode: PairMode::Development,
             audience: "bpc://localhost/development".into(),
             request_hmac_key: derive_request_hmac_key(secret).unwrap(),
+            request_protocol: PairRequestProtocol::V2,
             public_jwk: keypair.public_jwk().clone(),
             status: PairStatus::Active,
             created_at_ms: now,
@@ -134,6 +139,7 @@ async fn axum_hides_verifier_failure_details_by_default() {
         keypair.signing_key(),
         "pair_axum_errors",
         secret,
+        &BpcSigningContext::new("bpc://localhost/development", PairMode::Development).unwrap(),
         "POST",
         "/v1/widgets",
         body,
@@ -146,6 +152,7 @@ async fn axum_hides_verifier_failure_details_by_default() {
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/widgets")
+                .header("X-BPC-HMAC", headers.hmac)
                 .header("X-BPC-Pair-ID", headers.pair_id)
                 .header("X-BPC-Signature", format!("{}x", headers.signature))
                 .header("X-BPC-Signed-Data", headers.signed_data)
@@ -183,6 +190,7 @@ async fn axum_rejects_declared_oversized_body_before_buffering() {
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/widgets")
+                .header("X-BPC-HMAC", "x")
                 .header("X-BPC-Pair-ID", "pair_oversize")
                 .header("X-BPC-Signature", "x")
                 .header("X-BPC-Signed-Data", "x")
@@ -222,6 +230,7 @@ async fn axum_times_out_a_stalled_pre_auth_body_and_releases_its_permit() {
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/widgets")
+                .header("X-BPC-HMAC", "x")
                 .header("X-BPC-Pair-ID", "pair_stalled")
                 .header("X-BPC-Signature", "x")
                 .header("X-BPC-Signed-Data", "x")

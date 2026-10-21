@@ -1,44 +1,56 @@
 #![cfg(feature = "live-integration")]
 
 use std::env;
+use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bpc_protocol::{
-    AuditAction, AuditEvent, AuditLog, AuditSeverity, BpcKeyPair, GovernedRedisNonceConfig,
-    GovernedRedisNonceStore, NonceStore, PairAuthority, PairKind, PairMode, PairRegistration,
-    PairRegistry, PostgresAuditLog, PostgresAuthorityConfig, PostgresPairAuthority,
-    PostgresSecretProtector, Scope, SuccessClaim, derive_request_hmac_key, sign_rotation_at,
+    AuditAction, AuditEvent, AuditLog, AuditSeverity, BpcKeyPair, ContinuityGeneration,
+    GovernedRedisNonceConfig, GovernedRedisNonceStore, InMemoryContinuityAnchor, NonceStore,
+    PairAuthority, PairKind, PairMode, PairRegistration, PairRegistry, PairRequestProtocol,
+    PostgresAuditLog, PostgresAuthorityConfig, PostgresPairAuthority, PostgresSecretProtector,
+    RedisContinuityAnchor, Scope, SuccessClaim, derive_request_hmac_key, sign_rotation_at,
     verify_and_rotate_at,
 };
 use postgres::{Client, NoTls};
 use uuid::Uuid;
 
 fn required_env(name: &str) -> String {
-    env::var(name).unwrap_or_else(|_| {
-        panic!(
-            "{name} is required: live backend tests deliberately do not silently skip service integration"
-        )
-    })
+    env::var(name).unwrap_or_else(|_| panic!("{name} is required: live backend tests deliberately do not silently skip service integration"))
+}
+
+fn wait_until_reconciled(store: &GovernedRedisNonceStore) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match store.reconcile() {
+            Ok(()) => return,
+            Err(error) if Instant::now() >= deadline => {
+                panic!("Redis continuity quarantine did not expire: {error}");
+            }
+            Err(_) => {}
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
-fn governed_redis_fails_closed_then_detects_real_replay() {
+fn governed_redis_fails_closed_and_detects_marker_preserved_nonce_rollback() {
     let url = required_env("BPC_TEST_REDIS_URL");
     let namespace = format!("bpcitest{}", Uuid::new_v4().simple());
-    let mut config = GovernedRedisNonceConfig::new(namespace, "epoch-v1", 25).unwrap();
+    let mut config = GovernedRedisNonceConfig::new(namespace.clone(), 1_000).unwrap();
     config.allow_insecure_loopback = true;
     config.min_replica_acks = 0;
-    config.safety_buffer_ms = 5;
-    config.continuity_allowance_ms = 5;
+    config.safety_buffer_ms = 100;
+    config.continuity_allowance_ms = 100;
     config.command_timeout = Duration::from_secs(2);
-    let store = GovernedRedisNonceStore::connect(&url, config.clone()).unwrap();
+    let anchor = Arc::new(InMemoryContinuityAnchor::new(
+        ContinuityGeneration::new(1).unwrap(),
+    ));
+    let store = GovernedRedisNonceStore::connect(&url, config.clone(), anchor.clone()).unwrap();
 
-    // A fresh namespace is deliberately unusable until the full replay horizon
-    // has elapsed. This proves startup does not accept a potentially restored keyspace.
-    assert!(store.provision_epoch().is_err());
-    thread::sleep(Duration::from_millis(config.quarantine_ms().unwrap() + 20));
-    store.reconcile().unwrap();
+    assert!(store.provision_current_generation().is_err());
+    wait_until_reconciled(&store);
     let ttl = store.retention_ms().unwrap();
     let now = bpc_protocol::unix_ms().unwrap();
     assert!(
@@ -51,6 +63,21 @@ fn governed_redis_fails_closed_then_detects_real_replay() {
             .check_and_consume("pair_live_redis", "nonce-live-redis-1", now, now, ttl)
             .unwrap()
     );
+
+    // Simulate nonce-history rollback while marker/config remain. A recovery controller
+    // advances the independently anchored generation before it permits traffic again.
+    let tag = format!("{{{namespace}}}");
+    let key = format!("bpc:{tag}:nonce:pair_live_redis:nonce-live-redis-1");
+    let raw = redis::Client::open(url.as_str()).unwrap();
+    let mut raw = raw.get_connection().unwrap();
+    redis::cmd("DEL").arg(&key).query::<i64>(&mut raw).unwrap();
+    anchor.advance_after_fencing(&namespace).unwrap();
+    assert!(
+        store
+            .check_and_consume("pair_live_redis", "nonce-live-redis-1", now, now, ttl)
+            .is_err()
+    );
+    assert!(store.is_locally_quarantined());
 }
 
 #[test]
@@ -82,6 +109,7 @@ fn postgres_authority_and_audit_are_real_transactional_backends() {
             mode: PairMode::Production,
             audience: "bpc://live-postgres/production".into(),
             request_hmac_key: derive_request_hmac_key("LivePostgresSecret9!@")?,
+            request_protocol: PairRequestProtocol::V2,
             public_jwk: old_key.public_jwk().clone(),
             expires_at_ms: None,
             max_requests: Some(1),
@@ -101,15 +129,19 @@ fn postgres_authority_and_audit_are_real_transactional_backends() {
             .unwrap()
             .get(0);
         assert!(stored_ciphertext.starts_with("v1.test-key-v1."));
-        assert!(!stored_ciphertext.contains(&initial.request_hmac_key));
+        assert!(!stored_ciphertext.contains("LivePostgresSecret9!@"));
         assert_eq!(
             authority.claim_success(&initial, now)?,
             SuccessClaim::Claimed
         );
-        let exhausted = authority.get(&pair_id)?.expect("pair retained after cap");
-        assert_eq!(exhausted.status, bpc_protocol::PairStatus::Expired);
+        assert_eq!(
+            authority
+                .get(&pair_id)?
+                .expect("pair retained after cap")
+                .status,
+            bpc_protocol::PairStatus::Expired
+        );
 
-        // Rotation is tested separately on an unlimited successor registration.
         let rotate_key = BpcKeyPair::generate()?;
         let rotate_registration = PairRegistration {
             name: "rotation-live".into(),
@@ -117,6 +149,7 @@ fn postgres_authority_and_audit_are_real_transactional_backends() {
             mode: PairMode::Production,
             audience: "bpc://live-postgres/production".into(),
             request_hmac_key: derive_request_hmac_key("LiveRotationSecret9!@")?,
+            request_protocol: PairRequestProtocol::V2,
             public_jwk: rotate_key.public_jwk().clone(),
             expires_at_ms: None,
             max_requests: None,
@@ -163,7 +196,6 @@ fn postgres_authority_and_audit_are_real_transactional_backends() {
         assert!(audit.verify(Some(&audit.head()?))?.valid);
         Ok(())
     })();
-
     admin
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .unwrap();

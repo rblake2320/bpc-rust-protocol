@@ -1,10 +1,10 @@
-# BPC cryptographic assurance and v2 upgrade design
+# BPC cryptographic assurance and future high-assurance design
 
 BPC v1 is a layered request-authentication protocol. A request needs a registered public key, the client-held registration-secret factor, exact method/path/body binding, a fresh nonce and timestamp, an allowed scope, and a successful final durable-use claim. The Redis continuity guard, PostgreSQL authorization fencing, rotation, canary pairs, generic public errors, audit chain, and transport controls are part of that defense. They are not replaced by stronger mathematics.
 
-This document states the actual work factors of the current Rust implementation and defines the required BPC v2 direction. It does not certify a deployment and does not call any algorithm “unhackable.”
+This document states the actual work factors of legacy v1 and implemented v2, then records a future post-quantum high-assurance proposal. It does not certify a deployment and does not call any algorithm “unhackable.”
 
-## Current v1 work factors
+## Legacy v1 work factors
 
 BPC v1 uses ECDSA P-256 with SHA-256 for the request signature. NIST assigns P-256 approximately 128 bits of classical security; generic discrete-log recovery uses work on the order of the square root of a roughly 256-bit group order, or about \(2^{128}\) group operations. NIST assigns P-521 approximately 256 bits because its group order is at least 512 bits.[1] [2]
 
@@ -20,7 +20,15 @@ The factors are independent only when their secrets and custody boundaries are i
 
 The Rust crate now improves this immediately. `generate_registration_secret()` produces `Aa0!!` followed by an unfiltered encoding of 32 operating-system-random bytes. The fixed prefix satisfies the legacy v1 character policy without rejection sampling, so the random component retains exactly 256 bits. The Rust signer, direct HKDF helper, and Reqwest client reject source secrets that do not meet the documented legacy policy. This is a real improvement, but already-enrolled pairs and non-Rust clients need explicit rotation/adoption; the server sees only a derived verifier key and cannot prove a client chose a random source secret.
 
-## Concrete v1 limits that require a versioned change
+## Implemented BPC v2 profile and its honest limits
+
+The released BPC v2 profile fixes v1’s request-HMAC transplant weakness without misrepresenting a future algorithm migration. It keeps ECDSA P-256/SHA-256, SHA-256 body commitments, 32-byte HMAC-SHA-256 verifier keys, and UUID-v4 nonces. Its required canonical core is `audience`, `body_hash`, `method`, `mode`, `nonce`, `pair_id`, `path`, `purpose`, `timestamp`, and `version`; `version` is `2.0` and `purpose` is `http-request`.
+
+It calculates `HMAC-SHA-256(K_v2, "BPC-HMAC-v2\\0" || canonical_core)`, where `K_v2` is an HKDF-SHA-256 derivation with v2-specific salt/info labels. The P-256 P1363 signature authenticates `"BPC-SIGN-v2\\0" || canonical_core || "\\0" || base64url(hmac)`. Thus modifying any core field requires both factors; possession of a P-256 key alone cannot transplant a captured HMAC. BPC v2 rejects v1 by default and pair policy is stored server-side.
+
+This is still approximately a **128-bit classical** public-key profile and it is **not post-quantum**. If the server-held HMAC verifier leaks, the signature path remains P-256; if the client P-256 key leaks, the HMAC source remains the independent barrier. Endpoint compromise, rate-limit failure, secret custody failure, and a cryptographically relevant quantum computer remain outside a mathematical brute-force claim.
+
+## Concrete v1 limits that required a versioned change
 
 The current wire format does not cryptographically bind an audience/origin. The bundled Reqwest transport pins an HTTPS origin, but a raw v1 signature does not carry the intended service/tenant/environment. Pair credentials must therefore never be copied across audiences, and the BPC–TSK bridge must bind a server-controlled audience outside the v1 signature until v2 is available.
 
@@ -30,9 +38,9 @@ The stable display fingerprint is intentionally truncated to 20 base64url charac
 
 NIST states that FIPS 186-5 signature algorithms are not expected to resist a large-scale quantum computer.[2] A cryptographically relevant quantum computer would use Shor’s algorithm against P-256 and P-521 rather than merely halve their security. Ideal Grover-style search changes a 256-bit symmetric/preimage search to order \(2^{128}\) coherent evaluations, while generic collision algorithms have different bounds. This document makes no timeline claim about quantum hardware.
 
-## Required BPC v2 profile
+## Future high-assurance BPC v3 proposal (not implemented)
 
-BPC v2 must be a new parser, header family, registry record, test-vector corpus, and deployment cutover. It must never be implemented as optional v1 fields, a fallback after v2 verification fails, or an algorithm negotiated from unauthenticated request data.
+A future BPC-HYB v3 profile must be a new parser, header family, registry record, test-vector corpus, and deployment cutover. It must never be implemented as optional v2 fields, a fallback after v3 verification fails, or an algorithm negotiated from unauthenticated request data.
 
 The primary high-assurance suite is:
 
@@ -55,9 +63,9 @@ A hybrid is accepted only if every component verifies:
 
 The expression is not additive “512-bit security.” It requires an adversary to defeat both signature components for a signature forgery, while the surviving component defines protection after the other algorithm is broken. It also increases implementation complexity, which must be independently reviewed.[4]
 
-## Exact transcript and request binding
+## Future v3 transcript and request binding
 
-V2 must construct a flat, length-bounded, byte-for-byte canonical core object `C` with these required fields:
+The future v3 profile must construct a flat, length-bounded, byte-for-byte canonical core object `C` with these required fields:
 
 ```text
 algorithm_suite, audience, body_hash, environment, keyset_id, method,
@@ -82,7 +90,7 @@ The verifier must load an authorized dual-keyset record by `pair_id`, compare `k
 
 A dual-keyset record binds exactly one pair ID, one suite, one P-521 public key, one ML-DSA-87 public key, one keyset hash, one audience, one environment, activation/retirement epochs, and a minimum protocol version. A key ID is only a lookup hint. The authority record, not attacker-supplied headers, binds both keys to the same principal.
 
-Once a pair becomes v2-active, v1 is rejected for that pair. A v2 failure must never retry as v1. Capability negotiation, if needed, belongs in an authenticated enrollment/control-plane exchange and its resulting suite/version policy belongs in the authority record. Existing v1 credentials need a separately approved rotation/re-enrollment ceremony; there is no safe transparent upgrade from a P-256-only public key to a hybrid keyset.
+Once a pair becomes v3-active, v2 is rejected for that pair. A v3 failure must never retry as v2. Capability negotiation, if needed, belongs in an authenticated enrollment/control-plane exchange and its resulting suite/version policy belongs in the authority record. Existing v2 credentials need a separately approved rotation/re-enrollment ceremony; there is no safe transparent upgrade from a P-256-only public key to a hybrid keyset.
 
 Generate the P-521 key, ML-DSA seed/key, and HMAC source independently. Do not derive multiple factor secrets from a shared seed or reuse a signing key for another purpose. Keep each secret in a separate access-controlled custody domain where possible. Treat the ML-DSA seed as full private-key material. Audit keyset changes, enforce dual control for high-value changes, and make revocation and rotation actionable without waiting for model-assisted triage.
 

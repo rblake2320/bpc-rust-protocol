@@ -1,9 +1,9 @@
 [package]
 name = "bpc-protocol"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Rust implementation of the BPC (Bound Pair Credentials) v1 HTTP request protocol"
+description = "Rust implementation of the BPC (Bound Pair Credentials) v2 request-bound HTTP authentication protocol"
 license = "MIT"
 repository = "https://github.com/rblake2320/bpc-rust-protocol"
 readme = "README.md"
@@ -15,7 +15,7 @@ exclude = ["Cargo.toml.orig", "fuzz/**", "security-artifacts/**", "target/**"]
 default = []
 axum = ["dep:axum", "dep:http", "dep:tokio"]
 redis-store = ["dep:redis", "dep:url"]
-postgres-store = ["dep:aes-gcm", "dep:postgres", "dep:postgres_rustls", "dep:rustls-native-certs", "dep:tokio-rustls", "dep:url", "dep:zeroize"]
+postgres-store = ["dep:aes-gcm", "dep:postgres", "dep:postgres_rustls", "dep:rustls-native-certs", "dep:tokio-rustls", "dep:url"]
 reqwest-client = ["dep:reqwest"]
 production = ["axum", "redis-store", "postgres-store", "reqwest-client"]
 live-integration = ["redis-store", "postgres-store"]
@@ -43,7 +43,7 @@ tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "s
 tokio-rustls = { version = "0.26.1", optional = true }
 uuid = { version = "1.18.1", features = ["v4", "serde", "js"] }
 url = { version = "2.5.7", optional = true }
-zeroize = { version = "1.8.2", optional = true }
+zeroize = "1.8.2"
 
 [dev-dependencies]
 futures-util = "0.3.31"

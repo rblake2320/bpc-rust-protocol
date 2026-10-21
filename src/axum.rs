@@ -140,6 +140,10 @@ where
     N: NonceStore + 'static,
 {
     let (parts, body) = request.into_parts();
+    let hmac = match unique_header(&parts.headers, "x-bpc-hmac") {
+        Ok(value) => value,
+        Err(code) => return error_response(StatusCode::BAD_REQUEST, code),
+    };
     let pair_id = match unique_header(&parts.headers, "x-bpc-pair-id") {
         Ok(value) => value,
         Err(code) => return error_response(StatusCode::BAD_REQUEST, code),
@@ -196,6 +200,7 @@ where
             let _permit = verification_permit;
             verifier.verify(
                 BpcRequest {
+                    hmac: &hmac,
                     pair_id: &pair_id,
                     signature: &signature,
                     signed_data: &signed_data,
@@ -278,7 +283,8 @@ fn status_for(error: VerificationError, disclosure: BpcPublicErrorDisclosure) ->
             | VerificationError::InvalidSignedData
             | VerificationError::VersionMismatch
             | VerificationError::MissingBodyHash => StatusCode::BAD_REQUEST,
-            VerificationError::ReplayStoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            VerificationError::ReplayStoreUnavailable
+            | VerificationError::PairFinalizationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::UNAUTHORIZED,
         };
     }
@@ -289,7 +295,8 @@ fn status_for(error: VerificationError, disclosure: BpcPublicErrorDisclosure) ->
         | VerificationError::VersionMismatch
         | VerificationError::MissingBodyHash => StatusCode::BAD_REQUEST,
         VerificationError::ScopeViolation => StatusCode::FORBIDDEN,
-        VerificationError::ReplayStoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        VerificationError::ReplayStoreUnavailable
+        | VerificationError::PairFinalizationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::UNAUTHORIZED,
     }
 }
@@ -302,7 +309,10 @@ fn public_code(error: VerificationError, disclosure: BpcPublicErrorDisclosure) -
             | VerificationError::InvalidSignedData
             | VerificationError::VersionMismatch
             | VerificationError::MissingBodyHash => "invalid_request",
-            VerificationError::ReplayStoreUnavailable => "authentication_temporarily_unavailable",
+            VerificationError::ReplayStoreUnavailable
+            | VerificationError::PairFinalizationUnavailable => {
+                "authentication_temporarily_unavailable"
+            }
             _ => "unauthorized",
         };
     }

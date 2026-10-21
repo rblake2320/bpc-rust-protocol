@@ -6,7 +6,7 @@ use p256::ecdsa::SigningKey;
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method, Response, Url};
 
-use crate::{BpcError, Result, SignedHeaders, sign_request};
+use crate::{BpcError, BpcSigningContext, Result, SignedHeaders, sign_request};
 
 /// A BPC client whose caller owns the signing-key lifecycle.
 ///
@@ -19,6 +19,7 @@ pub struct BpcHttpClient {
     base_url: Url,
     pair_id: String,
     registration_secret: String,
+    signing_context: BpcSigningContext,
     signing_key: SigningKey,
 }
 
@@ -67,12 +68,14 @@ impl BpcHttpClient {
         base_url: Url,
         pair_id: impl Into<String>,
         registration_secret: impl Into<String>,
+        signing_context: BpcSigningContext,
         signing_key: SigningKey,
     ) -> Result<Self> {
         Self::new_with_config(
             base_url,
             pair_id,
             registration_secret,
+            signing_context,
             signing_key,
             BpcHttpClientConfig::default(),
         )
@@ -83,6 +86,7 @@ impl BpcHttpClient {
         base_url: Url,
         pair_id: impl Into<String>,
         registration_secret: impl Into<String>,
+        signing_context: BpcSigningContext,
         signing_key: SigningKey,
         config: BpcHttpClientConfig,
     ) -> Result<Self> {
@@ -128,6 +132,7 @@ impl BpcHttpClient {
             base_url,
             pair_id,
             registration_secret,
+            signing_context,
             signing_key,
         })
     }
@@ -144,6 +149,7 @@ impl BpcHttpClient {
             &self.signing_key,
             &self.pair_id,
             &self.registration_secret,
+            &self.signing_context,
             method,
             path_and_query,
             body,
@@ -164,6 +170,7 @@ impl BpcHttpClient {
         let headers = self.signed_headers(method.as_str(), path_and_query, &body)?;
         self.client
             .request(method, url)
+            .header("X-BPC-HMAC", headers.hmac)
             .header("X-BPC-Pair-ID", headers.pair_id)
             .header("X-BPC-Signature", headers.signature)
             .header("X-BPC-Signed-Data", headers.signed_data)
@@ -234,6 +241,11 @@ mod tests {
             Url::parse("https://api.example.test/").unwrap(),
             "pair_client",
             "ClientProtocolSecret9!@#",
+            crate::BpcSigningContext::new(
+                "bpc://api.example.test/production",
+                crate::PairMode::Production,
+            )
+            .unwrap(),
             SigningKey::random(&mut rand_core::OsRng),
         )
         .unwrap()
@@ -268,6 +280,11 @@ mod tests {
             Url::parse("https://api.example.test/").unwrap(),
             "pair_client",
             "weak",
+            crate::BpcSigningContext::new(
+                "bpc://api.example.test/production",
+                crate::PairMode::Production,
+            )
+            .unwrap(),
             SigningKey::random(&mut rand_core::OsRng),
         );
         assert!(matches!(result, Err(BpcError::SecretPolicy(_))));

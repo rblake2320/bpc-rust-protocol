@@ -9,14 +9,14 @@ use uuid::Uuid;
 
 use crate::{
     BpcError, CanaryClass, MAX_JS_SAFE_INTEGER, MAX_SIGNATURE_WINDOW_MS, PairKind, PairMode,
-    PairRecord, PairRegistry, PairStatus, PublicJwk, Result, Scope, SuccessClaim, b64url_encode,
-    is_valid_audience, is_valid_pair_id, rotation_hmac, sign_rotation_payload,
-    validate_request_hmac_key, verify_rotation_hmac, verify_rotation_payload,
+    PairRecord, PairRegistry, PairRequestProtocol, PairStatus, PublicJwk, Result, Scope,
+    SecretRequestHmacKey, SuccessClaim, b64url_encode, is_valid_audience, is_valid_pair_id,
+    rotation_hmac, sign_rotation_payload, verify_rotation_hmac, verify_rotation_payload,
 };
 
-/// Data submitted for a BPC pairing request. It intentionally contains only public material.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Validated BPC enrollment data. It contains verifier material and is neither
+/// serializable nor printable.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PairRegistration {
     pub name: String,
     pub scope: Scope,
@@ -24,14 +24,34 @@ pub struct PairRegistration {
     /// Locally configured trust domain for this credential, such as
     /// `bpc://api.example.test/tenant-a/production`.
     pub audience: String,
-    /// 32-byte HKDF-derived request HMAC key encoded as unpadded base64url.
-    pub request_hmac_key: String,
+    /// 32-byte HKDF-derived request-HMAC verifier material.
+    pub request_hmac_key: SecretRequestHmacKey,
+    /// New enrollment is secure-default BPC v2 only.
+    pub request_protocol: PairRequestProtocol,
     pub public_jwk: PublicJwk,
     pub expires_at_ms: Option<u64>,
     pub max_requests: Option<u64>,
-    #[serde(default)]
     pub kind: PairKind,
     pub canary_class: Option<CanaryClass>,
+}
+
+impl std::fmt::Debug for PairRegistration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairRegistration")
+            .field("name", &self.name)
+            .field("scope", &self.scope)
+            .field("mode", &self.mode)
+            .field("audience", &self.audience)
+            .field("request_hmac_key", &"[REDACTED]")
+            .field("request_protocol", &self.request_protocol)
+            .field("public_jwk", &self.public_jwk)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("max_requests", &self.max_requests)
+            .field("kind", &self.kind)
+            .field("canary_class", &self.canary_class)
+            .finish()
+    }
 }
 
 impl PairRegistration {
@@ -56,7 +76,11 @@ impl PairRegistration {
             ));
         }
         self.public_jwk.to_verifying_key()?;
-        validate_request_hmac_key(&self.request_hmac_key)?;
+        if self.request_protocol != PairRequestProtocol::V2 {
+            return Err(BpcError::PairRegistry(
+                "new registrations must use request-bound BPC v2".into(),
+            ));
+        }
         if matches!(self.kind, PairKind::Ghost) != self.canary_class.is_some() {
             return Err(BpcError::PairRegistry(
                 "ghost registrations require a canary class and legitimate registrations cannot have one".into(),
@@ -67,11 +91,22 @@ impl PairRegistration {
 }
 
 /// A registration request awaiting an authorized out-of-band approval decision.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingPairing {
     pub token: String,
     pub registration: PairRegistration,
     pub requested_at_ms: u64,
+}
+
+impl std::fmt::Debug for PendingPairing {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingPairing")
+            .field("token", &"[REDACTED]")
+            .field("registration", &self.registration)
+            .field("requested_at_ms", &self.requested_at_ms)
+            .finish()
+    }
 }
 
 /// Public, non-sensitive view suitable for a privileged management API.
@@ -215,6 +250,7 @@ impl PairAuthority for MemoryPairAuthority {
             mode: registration.mode,
             audience: registration.audience,
             request_hmac_key: registration.request_hmac_key,
+            request_protocol: registration.request_protocol,
             public_jwk: registration.public_jwk,
             status: PairStatus::Active,
             created_at_ms: now_ms,
@@ -407,6 +443,7 @@ pub fn verify_and_rotate_at<A: PairAuthority>(
         mode: old_pair.mode,
         audience: old_pair.audience.clone(),
         request_hmac_key: old_pair.request_hmac_key.clone(),
+        request_protocol: old_pair.request_protocol,
         public_jwk: request.new_public_jwk.clone(),
         status: PairStatus::Active,
         created_at_ms: now_ms,

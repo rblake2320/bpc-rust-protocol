@@ -20,13 +20,13 @@ All items below need recorded evidence for the exact release commit and deployme
 
 3. **Transport, identity, and custody**
    - Use `connect_tls` with PostgreSQL `sslmode=verify-full`, a trusted CA, hostname verification, least-privilege roles, connection/statement timeouts, backups, and restore/failover drills.
-   - Use a dedicated Redis tenancy with `rediss://`, ACLs, `noeviction`, persistence/failover policy, continuity epoch management, alarms, and restore/epoch-mismatch drills.
+   - Use a dedicated Redis tenancy with `rediss://`, ACLs, `noeviction`, persistence/failover policy, an independently durable monotonic continuity anchor, alarms, and fenced restore/promotion/generation-change drills. A static Redis or deployment epoch is not nonce-history evidence.
    - Obtain the `PostgresSecretProtector` AES-256 key from a KMS/HSM-backed secret manager; define an auditable re-encryption key-rotation procedure. Keep P-256 private keys and registration secrets out of source, logs, browser bundles, and ordinary process configuration where stronger custody is available.
 
 4. **Edge resilience and HTTP behavior**
    - Put an authenticated, rate-limited management/enrollment boundary in front of `request_pairing`; the global pending cap is only a final backstop.
    - Enforce reverse-proxy/server connection, header, request-body-read, and upstream timeouts; trusted-source/IP rate limits; request concurrency limits; and body-size limits before expensive verification.
-   - Preserve BPC's exact raw `path_and_query` and body bytes across TLS termination and proxies. Do not deploy streaming uploads under BPC v1 without a separately reviewed, versioned digest protocol.
+   - Preserve BPC v2's exact raw `path_and_query` and body bytes across TLS termination and proxies. Do not deploy streaming uploads without a separately reviewed, versioned digest protocol.
 
 5. **Audit, monitoring, and incident response**
    - Wire verified/rejected requests, ghost-pair hits, pair lifecycle operations, replay-store quarantine, and security alerts to a sanitized protected telemetry sink. Never record registration secrets, raw signatures, signed payloads, request bodies, or raw verifier keys.
@@ -34,7 +34,7 @@ All items below need recorded evidence for the exact release commit and deployme
    - Drill key compromise, secret compromise, ghost-pair detection, pair revocation, Redis continuity failure, PostgreSQL ambiguous outcome/failover, and restore scenarios.
 
 6. **Evidence-driven testing**
-   - Run the locked all-feature suite with real Redis/PostgreSQL, Node WebCrypto interoperability, format, Clippy, and advisory scans.
+   - Run the locked all-feature suite with real Redis/PostgreSQL, a CA-signed hostname-verified PostgreSQL TLS endpoint, Node WebCrypto interoperability, format, Clippy, and advisory scans.
    - Add pinned randomized differential vectors against maintained TypeScript and Python BPC references; include malformed JWK/base64/canonical JSON/UUID/path mutation corpora.
    - Run property/fuzz testing for untrusted parser and header input, concurrency/race stress for final claims/revoke/rotation, load tests for rate limits/body buffering, and fault injection for Redis/PostgreSQL timeouts, failover, and ambiguous commit outcomes.
 

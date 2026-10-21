@@ -1,42 +1,35 @@
 use uuid::{Uuid, Variant, Version};
 
 use crate::{
-    AuthSnapshot, BPC_PROTOCOL_VERSION, BpcError, BpcRequest, NonceStore, PairKind, PairMode,
-    PairRegistry, PairStatus, Result, SuccessClaim, VerificationError, VerificationResult,
-    body_hash, is_valid_audience, is_valid_pair_id, parse_canonical_payload, verify_payload_bytes,
-    verify_request_hmac,
+    AuthSnapshot, BPC_V2_PROTOCOL_VERSION, BpcError, BpcRequest, NonceStore, PairKind, PairMode,
+    PairRegistry, PairRequestProtocol, PairStatus, Result, SuccessClaim, VerificationError,
+    VerificationResult, body_hash_matches, is_valid_audience, is_valid_pair_id,
+    parse_canonical_payload, verify_payload_bytes, verify_request_hmac,
 };
 
 const MAX_SIGNATURE_LEN: usize = 256;
 const MAX_SIGNED_DATA_LEN: usize = 4096;
-/// Five minutes permits operational clock skew while preventing a configuration
-/// typo from silently creating an indefinite replay window.
+const MAX_HMAC_LEN: usize = 64;
+/// Five minutes permits operational clock skew while bounding replay retention.
 pub const MAX_SIGNATURE_WINDOW_MS: u64 = 5 * 60 * 1_000;
 
-/// Portable BPC verifier settings.
+/// Portable BPC verifier settings. The default accepts only BPC v2.
 #[derive(Clone, Debug)]
 pub struct BpcVerifierConfig {
-    /// Permitted difference between verifier and client clocks, in milliseconds.
     signature_window_ms: u64,
-    /// Exact locally trusted credential audience. BPC v1 enforces this against
-    /// the authority record; BPC v2 signs and MACs the same value on the wire.
     expected_audience: String,
-    /// Exact locally trusted lifecycle environment.
     expected_mode: PairMode,
 }
 
 impl Default for BpcVerifierConfig {
     fn default() -> Self {
-        // The default is deliberately a local development trust domain. A
-        // production pair cannot authorize through it by accident.
         Self::new("bpc://localhost/development", PairMode::Development)
             .expect("static local-development verifier configuration is valid")
     }
 }
 
 impl BpcVerifierConfig {
-    /// Builds a verifier configuration that only accepts one authority-record
-    /// audience and one operating mode.
+    /// Builds a verifier configuration bound to exactly one audience and mode.
     pub fn new(expected_audience: impl Into<String>, expected_mode: PairMode) -> Result<Self> {
         let expected_audience = expected_audience.into();
         if !is_valid_audience(&expected_audience) {
@@ -49,8 +42,7 @@ impl BpcVerifierConfig {
         })
     }
 
-    /// Sets a bounded request freshness window. Values outside 1 ms through
-    /// five minutes are rejected rather than weakening replay protection.
+    /// Sets a bounded request freshness window (1 ms through five minutes).
     pub fn with_signature_window_ms(mut self, value: u64) -> Result<Self> {
         if value == 0 || value > MAX_SIGNATURE_WINDOW_MS {
             return Err(BpcError::InvalidPayload(format!(
@@ -64,21 +56,15 @@ impl BpcVerifierConfig {
     pub fn signature_window_ms(&self) -> u64 {
         self.signature_window_ms
     }
-
     pub fn expected_audience(&self) -> &str {
         &self.expected_audience
     }
-
     pub fn expected_mode(&self) -> PairMode {
         self.expected_mode
     }
 }
 
-/// Framework-independent BPC verifier.
-///
-/// It deliberately does not parse HTTP headers or perform rate limiting. HTTP
-/// adapters should pass the exact method, path, and unmodified body bytes, and
-/// should apply their own rate controls before calling this verifier.
+/// Framework-independent BPC v2 verifier.
 #[derive(Clone, Debug, Default)]
 pub struct BpcVerifier {
     config: BpcVerifierConfig,
@@ -88,12 +74,10 @@ impl BpcVerifier {
     pub fn new(config: BpcVerifierConfig) -> Self {
         Self { config }
     }
-
     pub fn config(&self) -> &BpcVerifierConfig {
         &self.config
     }
 
-    /// Verifies against the current Unix time.
     pub fn verify<R: PairRegistry, N: NonceStore>(
         &self,
         request: BpcRequest<'_>,
@@ -109,7 +93,7 @@ impl BpcVerifier {
         }
     }
 
-    /// Verifies at a supplied Unix timestamp for deterministic integrations and tests.
+    /// Verifies at a supplied Unix timestamp for deterministic integrations/tests.
     pub fn verify_at<R: PairRegistry, N: NonceStore>(
         &self,
         request: BpcRequest<'_>,
@@ -118,6 +102,7 @@ impl BpcVerifier {
         now_ms: u64,
     ) -> VerificationResult {
         if request.pair_id.is_empty()
+            || request.hmac.is_empty()
             || request.signature.is_empty()
             || request.signed_data.is_empty()
         {
@@ -130,6 +115,7 @@ impl BpcVerifier {
             );
         }
         if !is_valid_pair_id(request.pair_id)
+            || request.hmac.len() > MAX_HMAC_LEN
             || request.signature.len() > MAX_SIGNATURE_LEN
             || request.signed_data.len() > MAX_SIGNED_DATA_LEN
         {
@@ -138,13 +124,13 @@ impl BpcVerifier {
                 VerificationError::InvalidSignedData,
             );
         }
-        if request.version != BPC_PROTOCOL_VERSION {
+        // Version selection is closed: there is no downgrade fallback from a failed v2 request.
+        if request.version != BPC_V2_PROTOCOL_VERSION {
             return VerificationResult::denied(
                 Some(request.pair_id),
                 VerificationError::VersionMismatch,
             );
         }
-
         let pair = match registry.get(request.pair_id) {
             Ok(Some(pair)) => pair,
             Ok(None) => {
@@ -160,6 +146,12 @@ impl BpcVerifier {
                 );
             }
         };
+        if pair.request_protocol != PairRequestProtocol::V2 {
+            return VerificationResult::denied(
+                Some(request.pair_id),
+                VerificationError::VersionMismatch,
+            );
+        }
         if pair.audience != self.config.expected_audience || pair.mode != self.config.expected_mode
         {
             return VerificationResult::denied(
@@ -225,23 +217,31 @@ impl BpcVerifier {
         match Uuid::parse_str(&payload.nonce) {
             Ok(nonce)
                 if nonce.get_version() == Some(Version::Random)
-                    && nonce.get_variant() == Variant::RFC4122 => {}
+                    && nonce.get_variant() == Variant::RFC4122
+                    && nonce.to_string() == payload.nonce => {}
             _ => {
                 return VerificationResult::denied(
                     Some(request.pair_id),
                     VerificationError::InvalidSignedData,
                 );
             }
-        };
-        if !verify_request_hmac(
-            &pair.request_hmac_key,
-            &payload.nonce,
-            payload.timestamp,
-            &payload.secret_hmac,
-        ) {
+        }
+        // The HMAC covers every canonical field below, including pair identity,
+        // audience, mode, method, path, body commitment, purpose, and version.
+        if !verify_request_hmac(&pair.request_hmac_key, &canonical, request.hmac) {
             return VerificationResult::denied(
                 Some(request.pair_id),
                 VerificationError::InvalidSecretHmac,
+            );
+        }
+        if payload.audience != pair.audience
+            || payload.audience != self.config.expected_audience
+            || payload.mode != pair.mode
+            || payload.mode != self.config.expected_mode
+        {
+            return VerificationResult::denied(
+                Some(request.pair_id),
+                VerificationError::AudienceMismatch,
             );
         }
         if now_ms.abs_diff(payload.timestamp) > self.config.signature_window_ms {
@@ -268,13 +268,7 @@ impl BpcVerifier {
                 VerificationError::ScopeViolation,
             );
         }
-        if payload.body_hash.is_empty() {
-            return VerificationResult::denied(
-                Some(request.pair_id),
-                VerificationError::MissingBodyHash,
-            );
-        }
-        if payload.body_hash != body_hash(request.body) {
+        if !body_hash_matches(&payload, request.body) {
             return VerificationResult::denied(
                 Some(request.pair_id),
                 VerificationError::InvalidBodyHash,
@@ -283,33 +277,31 @@ impl BpcVerifier {
         let verifying_key = match pair.public_jwk.to_verifying_key() {
             Ok(key) => key,
             Err(_) => {
-                return self.reject_authenticated_signature_failure(
-                    registry,
-                    request.pair_id,
+                return VerificationResult::denied(
+                    Some(request.pair_id),
                     VerificationError::InvalidSignature,
                 );
             }
         };
-        if !verify_payload_bytes(&verifying_key, &canonical, request.signature) {
-            return self.reject_authenticated_signature_failure(
-                registry,
-                request.pair_id,
+        if !verify_payload_bytes(&verifying_key, &canonical, request.hmac, request.signature) {
+            return VerificationResult::denied(
+                Some(request.pair_id),
                 VerificationError::InvalidSignature,
             );
         }
-
-        // Only a fully verified request is permitted to consume its nonce.
-        let ttl_ms = self
+        let ttl_ms = match self
             .config
             .signature_window_ms
             .checked_mul(2)
             .and_then(|value| value.checked_add(10_000))
-            .ok_or_else(|| BpcError::InvalidPayload("nonce retention overflows".into()));
-        let Ok(ttl_ms) = ttl_ms else {
-            return VerificationResult::denied(
-                Some(request.pair_id),
-                VerificationError::ReplayStoreUnavailable,
-            );
+        {
+            Some(value) => value,
+            None => {
+                return VerificationResult::denied(
+                    Some(request.pair_id),
+                    VerificationError::ReplayStoreUnavailable,
+                );
+            }
         };
         let replay = match nonce_store.check_and_consume(
             request.pair_id,
@@ -332,23 +324,19 @@ impl BpcVerifier {
                 VerificationError::ReplayDetected,
             );
         }
-
-        // A canary request proves credential exposure. Its nonce is intentionally
-        // spent after full verification, but it never produces authorization.
         if pair.kind == PairKind::Ghost {
             return VerificationResult::denied(
                 Some(request.pair_id),
                 VerificationError::GhostPairDenied,
             );
         }
-
-        // Reclaim registry state atomically after crypto verification. A durable
-        // registry should re-check expiry/status/usage under its own transaction.
         match registry.claim_success(&pair, now_ms) {
             Ok(SuccessClaim::Claimed) => VerificationResult::authorized(AuthSnapshot {
                 pair_id: request.pair_id.to_owned(),
                 scope: pair.scope,
                 mode: pair.mode,
+                audience: pair.audience.clone(),
+                request_protocol: pair.request_protocol,
                 kind: pair.kind,
                 canary_class: pair.canary_class,
                 verified_at_ms: now_ms,
@@ -360,23 +348,15 @@ impl BpcVerifier {
                 Some(request.pair_id),
                 VerificationError::PairUsageCapExceeded,
             ),
-            Ok(SuccessClaim::StateChanged) | Err(_) => VerificationResult::denied(
+            Ok(SuccessClaim::StateChanged) => VerificationResult::denied(
                 Some(request.pair_id),
                 VerificationError::PairStateChanged,
             ),
+            Err(_) => VerificationResult::denied(
+                Some(request.pair_id),
+                VerificationError::PairFinalizationUnavailable,
+            ),
         }
-    }
-
-    /// Invalid signatures deliberately never mutate credential state. A visible
-    /// on-wire HMAC tag can be replayed, so lockout must be implemented at a
-    /// trusted rate-limited edge rather than as a permanent pair-wide penalty.
-    fn reject_authenticated_signature_failure<R: PairRegistry>(
-        &self,
-        _registry: &R,
-        pair_id: &str,
-        error: VerificationError,
-    ) -> VerificationResult {
-        VerificationResult::denied(Some(pair_id), error)
     }
 }
 

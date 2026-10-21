@@ -9,13 +9,15 @@ use sha2::{Digest, Sha256};
 
 use crate::authority::canonical_rotation_bytes;
 use crate::canonical::canonical_payload_bytes;
-use crate::{BpcError, BpcPayload, PublicJwk, Result, RotationPayload};
+use crate::{BpcError, BpcPayload, PublicJwk, Result, RotationPayload, SecretRequestHmacKey};
 
-const HKDF_SALT: &[u8] = b"bpc-protocol-hmac-salt-v1";
-const HKDF_INFO: &[u8] = b"bpc-v1-hmac-key";
+const HKDF_SALT_V2: &[u8] = b"bpc-protocol-hmac-salt-v2";
+const HKDF_INFO_V2: &[u8] = b"bpc-v2-request-hmac-key";
+const REQUEST_HMAC_DOMAIN_V2: &[u8] = b"BPC-HMAC-v2\0";
+const REQUEST_SIGNATURE_DOMAIN_V2: &[u8] = b"BPC-SIGN-v2\0";
 const ROTATION_HMAC_DOMAIN: &[u8] = b"bpc-rotation-hmac-v2\0";
 
-/// Base64url-encodes bytes without padding, as required by BPC v1.
+/// Base64url-encodes bytes without padding, as required by BPC.
 pub fn b64url_encode(bytes: impl AsRef<[u8]>) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -36,41 +38,41 @@ pub fn b64url_decode(value: &str) -> Result<Vec<u8>> {
 
 /// SHA-256 body commitment in BPC's `sha256:<base64url-digest>` form.
 pub fn body_hash(body: &[u8]) -> String {
-    let digest = Sha256::digest(body);
-    format!("sha256:{}", b64url_encode(digest))
+    format!("sha256:{}", b64url_encode(Sha256::digest(body)))
 }
 
-/// Derives the BPC request-HMAC key with HKDF-SHA-256.
+/// Derives a BPC v2 request-HMAC verifier with HKDF-SHA-256.
 ///
-/// The server receives only this derived verifier and cannot estimate source
-/// secret entropy, so Rust callers must pass a source secret that satisfies the
-/// BPC policy. Prefer [`generate_registration_secret`] over a human value.
-pub fn derive_request_hmac_key(secret: &str) -> Result<String> {
+/// The derived verifier is secret authentication material. The source secret
+/// must satisfy BPC policy; prefer [`generate_registration_secret`].
+pub fn derive_request_hmac_key(secret: &str) -> Result<SecretRequestHmacKey> {
     validate_secret(secret)?;
-    let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), secret.as_bytes());
+    let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT_V2), secret.as_bytes());
     let mut output = [0_u8; 32];
-    hkdf.expand(HKDF_INFO, &mut output)
+    hkdf.expand(HKDF_INFO_V2, &mut output)
         .map_err(|_| BpcError::InvalidHmacKey)?;
-    Ok(b64url_encode(output))
+    SecretRequestHmacKey::from_base64url(b64url_encode(output))
 }
 
-/// Computes the BPC request HMAC over `nonce || decimal(timestamp)`.
-pub fn request_hmac(request_hmac_key: &str, nonce: &str, timestamp: u64) -> Result<String> {
-    let key = b64url_decode(request_hmac_key)?;
+/// Computes the BPC v2 HMAC over the entire canonical request core.
+pub fn request_hmac(
+    request_hmac_key: &SecretRequestHmacKey,
+    canonical_core: &[u8],
+) -> Result<String> {
+    let key = b64url_decode(request_hmac_key.encoded())?;
     if key.len() != 32 {
         return Err(BpcError::InvalidHmacKey);
     }
     let mut mac = Hmac::<Sha256>::new_from_slice(&key).map_err(|_| BpcError::InvalidHmacKey)?;
-    mac.update(nonce.as_bytes());
-    mac.update(timestamp.to_string().as_bytes());
+    mac.update(REQUEST_HMAC_DOMAIN_V2);
+    mac.update(canonical_core);
     Ok(b64url_encode(mac.finalize().into_bytes()))
 }
 
-/// Constant-time validates a full BPC request HMAC.
+/// Constant-time validates a BPC v2 HMAC over the entire canonical core.
 pub fn verify_request_hmac(
-    request_hmac_key: &str,
-    nonce: &str,
-    timestamp: u64,
+    request_hmac_key: &SecretRequestHmacKey,
+    canonical_core: &[u8],
     provided_hmac: &str,
 ) -> bool {
     if provided_hmac.len() != 43
@@ -80,31 +82,29 @@ pub fn verify_request_hmac(
     {
         return false;
     }
-    let Ok(key) = b64url_decode(request_hmac_key) else {
+    let Ok(key) = b64url_decode(request_hmac_key.encoded()) else {
         return false;
     };
-    if key.len() != 32 {
-        return false;
-    }
     let Ok(tag) = b64url_decode(provided_hmac) else {
         return false;
     };
-    if tag.len() != 32 {
+    if key.len() != 32 || tag.len() != 32 {
         return false;
     }
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&key) else {
         return false;
     };
-    mac.update(nonce.as_bytes());
-    mac.update(timestamp.to_string().as_bytes());
+    mac.update(REQUEST_HMAC_DOMAIN_V2);
+    mac.update(canonical_core);
     mac.verify_slice(&tag).is_ok()
 }
 
-/// Computes the second factor for a rotation over the exact canonical rotation
-/// transcript under an unambiguous domain label. Unlike the legacy request
-/// HMAC, a captured request tag cannot be transplanted into this operation.
-pub fn rotation_hmac(request_hmac_key: &str, canonical_rotation: &[u8]) -> Result<String> {
-    let key = b64url_decode(request_hmac_key)?;
+/// Computes the second factor for a key-rotation request.
+pub fn rotation_hmac(
+    request_hmac_key: &SecretRequestHmacKey,
+    canonical_rotation: &[u8],
+) -> Result<String> {
+    let key = b64url_decode(request_hmac_key.encoded())?;
     if key.len() != 32 {
         return Err(BpcError::InvalidHmacKey);
     }
@@ -116,7 +116,7 @@ pub fn rotation_hmac(request_hmac_key: &str, canonical_rotation: &[u8]) -> Resul
 
 /// Constant-time validates the domain-separated full-rotation transcript HMAC.
 pub fn verify_rotation_hmac(
-    request_hmac_key: &str,
+    request_hmac_key: &SecretRequestHmacKey,
     canonical_rotation: &[u8],
     provided_hmac: &str,
 ) -> bool {
@@ -127,10 +127,10 @@ pub fn verify_rotation_hmac(
     {
         return false;
     }
-    let Ok(key) = b64url_decode(request_hmac_key) else {
-        return false;
-    };
-    let Ok(tag) = b64url_decode(provided_hmac) else {
+    let (Ok(key), Ok(tag)) = (
+        b64url_decode(request_hmac_key.encoded()),
+        b64url_decode(provided_hmac),
+    ) else {
         return false;
     };
     if key.len() != 32 || tag.len() != 32 {
@@ -144,10 +144,31 @@ pub fn verify_rotation_hmac(
     mac.verify_slice(&tag).is_ok()
 }
 
-/// Signs canonical BPC JSON with ECDSA P-256/SHA-256 and returns a 64-byte P1363 base64url signature.
-pub fn sign_payload(signing_key: &SigningKey, payload: &BpcPayload) -> Result<String> {
-    let message = canonical_payload_bytes(payload)?;
-    let signature: Signature = signing_key.sign(&message);
+/// Builds the byte-exact BPC v2 signature transcript. The visible HMAC header
+/// is signed, preventing header substitution after the client signs the core.
+pub fn request_signature_transcript(canonical_core: &[u8], hmac: &str) -> Result<Vec<u8>> {
+    if hmac.len() != 43
+        || !hmac
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(BpcError::InvalidHmacKey);
+    }
+    let mut transcript = Vec::with_capacity(
+        REQUEST_SIGNATURE_DOMAIN_V2.len() + canonical_core.len() + 1 + hmac.len(),
+    );
+    transcript.extend_from_slice(REQUEST_SIGNATURE_DOMAIN_V2);
+    transcript.extend_from_slice(canonical_core);
+    transcript.push(0);
+    transcript.extend_from_slice(hmac.as_bytes());
+    Ok(transcript)
+}
+
+/// Signs the BPC v2 core and its corresponding HMAC header with P-256/SHA-256.
+pub fn sign_payload(signing_key: &SigningKey, payload: &BpcPayload, hmac: &str) -> Result<String> {
+    let canonical = canonical_payload_bytes(payload)?;
+    let transcript = request_signature_transcript(&canonical, hmac)?;
+    let signature: Signature = signing_key.sign(&transcript);
     Ok(b64url_encode(signature.to_bytes()))
 }
 
@@ -161,20 +182,20 @@ pub fn sign_rotation_payload(
     Ok(b64url_encode(signature.to_bytes()))
 }
 
-/// Verifies a 64-byte P1363 BPC signature over canonical JSON.
-pub fn verify_payload(verifying_key: &VerifyingKey, payload: &BpcPayload, signature: &str) -> bool {
-    let Ok(message) = canonical_payload_bytes(payload) else {
-        return false;
-    };
-    verify_payload_bytes(verifying_key, &message, signature)
-}
-
-/// Verifies a 64-byte P1363 BPC signature over prevalidated canonical JSON bytes.
+/// Verifies a 64-byte P1363 BPC v2 signature over core-plus-HMAC transcript bytes.
 pub fn verify_payload_bytes(
     verifying_key: &VerifyingKey,
-    canonical_bytes: &[u8],
+    canonical_core: &[u8],
+    hmac: &str,
     signature: &str,
 ) -> bool {
+    let Ok(transcript) = request_signature_transcript(canonical_core, hmac) else {
+        return false;
+    };
+    verify_signature_bytes(verifying_key, &transcript, signature)
+}
+
+fn verify_signature_bytes(verifying_key: &VerifyingKey, message: &[u8], signature: &str) -> bool {
     let Ok(bytes) = b64url_decode(signature) else {
         return false;
     };
@@ -184,7 +205,7 @@ pub fn verify_payload_bytes(
     let Ok(signature) = Signature::from_slice(&bytes) else {
         return false;
     };
-    verifying_key.verify(canonical_bytes, &signature).is_ok()
+    verifying_key.verify(message, &signature).is_ok()
 }
 
 /// Verifies an already-canonical key-rotation payload with a P1363 signature.
@@ -193,13 +214,12 @@ pub fn verify_rotation_payload(
     canonical_bytes: &[u8],
     signature: &str,
 ) -> bool {
-    verify_payload_bytes(verifying_key, canonical_bytes, signature)
+    verify_signature_bytes(verifying_key, canonical_bytes, signature)
 }
 
-/// Stable 20-character public-key fingerprint shared with the JavaScript and Python implementations.
+/// Stable 20-character public-key fingerprint shared with interoperable implementations.
 pub fn compute_fingerprint(jwk: &PublicJwk) -> Result<String> {
     jwk.to_verifying_key()?;
-    // The required-member field order is intentionally the reference implementation's order.
     let canonical = format!(
         "{{\"crv\":\"{}\",\"kty\":\"{}\",\"x\":\"{}\",\"y\":\"{}\"}}",
         jwk.crv, jwk.kty, jwk.x, jwk.y
@@ -240,12 +260,6 @@ pub fn validate_secret(secret: &str) -> Result<()> {
 }
 
 /// Generates a registration secret with an exact 256-bit OS-random component.
-///
-/// A fixed `Aa0!!` prefix satisfies BPC v1's legacy composition policy without
-/// conditioning the random bytes. This is preferable to human-selected
-/// secrets: rejection sampling a base64url string for character categories
-/// would reduce its entropy below 256 bits. Store the returned value in a
-/// secret manager and expose it only to the intended signing client.
 pub fn generate_registration_secret() -> Result<String> {
     let mut bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut bytes);

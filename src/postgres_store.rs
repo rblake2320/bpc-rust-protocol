@@ -12,6 +12,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use postgres::{Client, NoTls, Row, Transaction};
 use postgres_rustls::{MakeTlsConnector, set_postgresql_alpn};
 use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_rustls::TlsConnector;
@@ -22,8 +23,8 @@ use zeroize::Zeroize;
 use crate::{
     AuditAction, AuditEntry, AuditEvent, AuditHead, AuditLog, AuditSeverity, AuditVerification,
     BpcError, CanaryClass, PairAuthority, PairKind, PairMode, PairRecord, PairRegistration,
-    PairRegistry, PairStatus, PublicJwk, RedactedPair, Result, Scope, SuccessClaim, b64url_decode,
-    b64url_encode,
+    PairRegistry, PairRequestProtocol, PairStatus, PublicJwk, RedactedPair, Result, Scope,
+    SecretRequestHmacKey, SuccessClaim, b64url_decode, b64url_encode,
 };
 
 /// Encrypts BPC verifier material before it enters a durable PostgreSQL row.
@@ -163,6 +164,7 @@ CREATE TABLE IF NOT EXISTS bpc_pairs (
     scope                 TEXT NOT NULL CHECK (scope IN ('read','read-write','admin')),
     mode                  TEXT NOT NULL CHECK (mode IN ('development','production')),
     audience              VARCHAR(256) NOT NULL CHECK (audience ~ '^[A-Za-z0-9:./_-]+$'),
+    request_protocol      TEXT NOT NULL CHECK (request_protocol IN ('v1-compatibility','v2')),
     request_hmac_ciphertext TEXT NOT NULL CHECK (length(request_hmac_ciphertext) <= 512),
     public_jwk            JSONB NOT NULL CHECK (
         public_jwk->>'kty' = 'EC' AND public_jwk->>'crv' = 'P-256'
@@ -185,6 +187,7 @@ CREATE INDEX IF NOT EXISTS bpc_pairs_active_idx ON bpc_pairs (status) WHERE stat
 CREATE TABLE IF NOT EXISTS bpc_pending (
     token_hash       CHAR(64) PRIMARY KEY CHECK (token_hash ~ '^[0-9a-f]{64}$'),
     registration_ciphertext TEXT NOT NULL CHECK (length(registration_ciphertext) <= 4096),
+    request_hmac_ciphertext TEXT NOT NULL CHECK (length(request_hmac_ciphertext) <= 512),
     requested_at_ms  BIGINT NOT NULL CHECK (requested_at_ms >= 0 AND requested_at_ms <= 9007199254740991),
     expires_at_ms    BIGINT NOT NULL CHECK (expires_at_ms >= requested_at_ms AND expires_at_ms <= 9007199254740991)
 );
@@ -218,6 +221,20 @@ CREATE TABLE IF NOT EXISTS bpc_audit (
 );
 CREATE INDEX IF NOT EXISTS bpc_audit_pair_idx ON bpc_audit (pair_id, sequence DESC);
 CREATE INDEX IF NOT EXISTS bpc_audit_time_idx ON bpc_audit (timestamp_ms DESC);
+"#;
+
+// Existing active rows become explicit v1 compatibility records, which the
+// secure-default verifier rejects. Old pending rows cannot prove explicit v2
+// enrollment intent, so they are discarded rather than silently downgraded.
+const POSTGRES_V2_MIGRATION: &str = r#"
+ALTER TABLE bpc_pairs ADD COLUMN IF NOT EXISTS request_protocol TEXT;
+UPDATE bpc_pairs SET request_protocol = 'v1-compatibility' WHERE request_protocol IS NULL;
+ALTER TABLE bpc_pairs ALTER COLUMN request_protocol SET NOT NULL;
+ALTER TABLE bpc_pairs DROP CONSTRAINT IF EXISTS bpc_pairs_request_protocol_check;
+ALTER TABLE bpc_pairs ADD CONSTRAINT bpc_pairs_request_protocol_check CHECK (request_protocol IN ('v1-compatibility','v2'));
+ALTER TABLE bpc_pending ADD COLUMN IF NOT EXISTS request_hmac_ciphertext TEXT;
+DELETE FROM bpc_pending WHERE request_hmac_ciphertext IS NULL;
+ALTER TABLE bpc_pending ALTER COLUMN request_hmac_ciphertext SET NOT NULL;
 "#;
 
 /// PostgreSQL authority configuration.
@@ -276,6 +293,58 @@ pub struct PostgresPairAuthority {
     config: PostgresAuthorityConfig,
 }
 
+/// Private, non-secret pending enrollment metadata. The verifier key is sealed
+/// separately with distinct authenticated data, so JSON buffers never contain
+/// it and public domain objects need no Serde implementation.
+#[derive(Serialize, Deserialize)]
+struct PendingRegistrationMetadata {
+    name: String,
+    scope: Scope,
+    mode: PairMode,
+    audience: String,
+    request_protocol: PairRequestProtocol,
+    public_jwk: PublicJwk,
+    expires_at_ms: Option<u64>,
+    max_requests: Option<u64>,
+    kind: PairKind,
+    canary_class: Option<CanaryClass>,
+}
+
+impl From<&PairRegistration> for PendingRegistrationMetadata {
+    fn from(registration: &PairRegistration) -> Self {
+        Self {
+            name: registration.name.clone(),
+            scope: registration.scope,
+            mode: registration.mode,
+            audience: registration.audience.clone(),
+            request_protocol: registration.request_protocol,
+            public_jwk: registration.public_jwk.clone(),
+            expires_at_ms: registration.expires_at_ms,
+            max_requests: registration.max_requests,
+            kind: registration.kind,
+            canary_class: registration.canary_class,
+        }
+    }
+}
+
+impl PendingRegistrationMetadata {
+    fn into_registration(self, request_hmac_key: SecretRequestHmacKey) -> PairRegistration {
+        PairRegistration {
+            name: self.name,
+            scope: self.scope,
+            mode: self.mode,
+            audience: self.audience,
+            request_hmac_key,
+            request_protocol: self.request_protocol,
+            public_jwk: self.public_jwk,
+            expires_at_ms: self.expires_at_ms,
+            max_requests: self.max_requests,
+            kind: self.kind,
+            canary_class: self.canary_class,
+        }
+    }
+}
+
 impl PostgresPairAuthority {
     /// Connects only to an explicitly loopback PostgreSQL endpoint without TLS.
     /// Production callers must use [`Self::connect_tls`].
@@ -310,7 +379,10 @@ impl PostgresPairAuthority {
         let mut client = self.lock_client()?;
         ensure_schema(&mut client, &self.config.schema)?;
         set_schema(&mut client, &self.config.schema)?;
-        client.batch_execute(POSTGRES_SCHEMA).map_err(pg_error)
+        client.batch_execute(POSTGRES_SCHEMA).map_err(pg_error)?;
+        client
+            .batch_execute(POSTGRES_V2_MIGRATION)
+            .map_err(pg_error)
     }
 
     fn lock_client(&self) -> Result<std::sync::MutexGuard<'_, Client>> {
@@ -454,11 +526,17 @@ impl PairAuthority for PostgresPairAuthority {
             .ok_or_else(|| BpcError::PairRegistry("approval expiration overflow".into()))?;
         let token = format!("approval_{}", Uuid::new_v4().simple());
         let token_hash = hash_token(&token);
-        let registration_json = serde_json::to_vec(&registration)?;
+        let mut registration_json =
+            serde_json::to_vec(&PendingRegistrationMetadata::from(&registration))?;
         let registration_ciphertext = self
             .config
             .secret_protector
-            .seal(&pending_secret_context(&token_hash), &registration_json)?;
+            .seal(&pending_metadata_context(&token_hash), &registration_json)?;
+        registration_json.zeroize();
+        let request_hmac_ciphertext = self.config.secret_protector.seal(
+            &pending_hmac_context(&token_hash),
+            registration.request_hmac_key.encoded().as_bytes(),
+        )?;
         let mut client = self.lock_client()?;
         let mut tx = self.begin(&mut client)?;
         tx.execute(
@@ -480,8 +558,8 @@ impl PairAuthority for PostgresPairAuthority {
             ));
         }
         tx.execute(
-            "INSERT INTO bpc_pending(token_hash,registration_ciphertext,requested_at_ms,expires_at_ms) VALUES($1,$2,$3,$4)",
-            &[&token_hash, &registration_ciphertext, &to_i64(now_ms)?, &to_i64(expires)?],
+            "INSERT INTO bpc_pending(token_hash,registration_ciphertext,request_hmac_ciphertext,requested_at_ms,expires_at_ms) VALUES($1,$2,$3,$4,$5)",
+            &[&token_hash, &registration_ciphertext, &request_hmac_ciphertext, &to_i64(now_ms)?, &to_i64(expires)?],
         )
         .map_err(pg_error)?;
         tx.commit().map_err(pg_error)?;
@@ -499,7 +577,7 @@ impl PairAuthority for PostgresPairAuthority {
         tx.query_one("SELECT pg_advisory_xact_lock(842321904)", &[])
             .map_err(pg_error)?;
         let pending = tx.query_opt(
-            "SELECT registration_ciphertext, expires_at_ms FROM bpc_pending WHERE token_hash=$1 FOR UPDATE",
+            "SELECT registration_ciphertext, request_hmac_ciphertext, expires_at_ms FROM bpc_pending WHERE token_hash=$1 FOR UPDATE",
             &[&token_hash],
         ).map_err(pg_error)?;
         let Some(pending) = pending else {
@@ -520,10 +598,22 @@ impl PairAuthority for PostgresPairAuthority {
         }
         let registration_ciphertext: String = pending.get("registration_ciphertext");
         let registration_json = self.config.secret_protector.open(
-            &pending_secret_context(&token_hash),
+            &pending_metadata_context(&token_hash),
             &registration_ciphertext,
         )?;
-        let registration: PairRegistration = serde_json::from_slice(&registration_json)?;
+        let metadata: PendingRegistrationMetadata = serde_json::from_slice(&registration_json)?;
+        let request_hmac_ciphertext: String = pending.get("request_hmac_ciphertext");
+        let request_hmac_key = SecretRequestHmacKey::from_base64url(
+            String::from_utf8(
+                self.config
+                    .secret_protector
+                    .open(&pending_hmac_context(&token_hash), &request_hmac_ciphertext)?,
+            )
+            .map_err(|_| {
+                BpcError::PairRegistry("stored pending verifier key is not UTF-8".into())
+            })?,
+        )?;
+        let registration = metadata.into_registration(request_hmac_key);
         registration.validate()?;
         if registration
             .expires_at_ms
@@ -567,6 +657,7 @@ impl PairAuthority for PostgresPairAuthority {
             mode: registration.mode,
             audience: registration.audience,
             request_hmac_key: registration.request_hmac_key,
+            request_protocol: registration.request_protocol,
             public_jwk: registration.public_jwk,
             status: PairStatus::Active,
             created_at_ms: now_ms,
@@ -893,12 +984,12 @@ fn insert_pair(
     let jwk = serde_json::to_value(&pair.public_jwk)?;
     let request_hmac_ciphertext = secret_protector.seal(
         &pair_secret_context(&pair.id),
-        pair.request_hmac_key.as_bytes(),
+        pair.request_hmac_key.encoded().as_bytes(),
     )?;
     let rows = tx.execute(
-        "INSERT INTO bpc_pairs(id,name,scope,mode,audience,request_hmac_ciphertext,public_jwk,status,created_at_ms,expires_at_ms,max_requests,requests,failed_signatures,authorization_version,kind,canary_class,replaced_by)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
-        &[&pair.id, &pair.name, &scope_text(pair.scope), &mode_text(pair.mode), &pair.audience, &request_hmac_ciphertext, &jwk,
+        "INSERT INTO bpc_pairs(id,name,scope,mode,audience,request_protocol,request_hmac_ciphertext,public_jwk,status,created_at_ms,expires_at_ms,max_requests,requests,failed_signatures,authorization_version,kind,canary_class,replaced_by)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
+        &[&pair.id, &pair.name, &scope_text(pair.scope), &mode_text(pair.mode), &pair.audience, &protocol_text(pair.request_protocol), &request_hmac_ciphertext, &jwk,
           &status_text(pair.status), &to_i64(pair.created_at_ms)?, &option_i64(pair.expires_at_ms)?, &option_i64(pair.max_requests)?,
           &to_i64(pair.requests)?, &i32::try_from(pair.failed_signatures).map_err(|_| BpcError::PairRegistry("failed signatures overflow".into()))?,
           &to_i64(pair.authorization_version)?, &kind_text(pair.kind), &pair.canary_class.map(canary_text), &pair.replaced_by],
@@ -916,10 +1007,14 @@ fn row_to_pair(row: Row, secret_protector: &PostgresSecretProtector) -> Result<P
     let public_jwk: PublicJwk = serde_json::from_value(jwk)?;
     let id: String = row.get("id");
     let request_hmac_ciphertext: String = row.get("request_hmac_ciphertext");
-    let request_hmac_key = String::from_utf8(
-        secret_protector.open(&pair_secret_context(&id), &request_hmac_ciphertext)?,
-    )
-    .map_err(|_| BpcError::PairRegistry("stored PostgreSQL verifier key is not UTF-8".into()))?;
+    let request_hmac_key = SecretRequestHmacKey::from_base64url(
+        String::from_utf8(
+            secret_protector.open(&pair_secret_context(&id), &request_hmac_ciphertext)?,
+        )
+        .map_err(|_| {
+            BpcError::PairRegistry("stored PostgreSQL verifier key is not UTF-8".into())
+        })?,
+    )?;
     let pair = PairRecord {
         id,
         name: row.get("name"),
@@ -927,6 +1022,7 @@ fn row_to_pair(row: Row, secret_protector: &PostgresSecretProtector) -> Result<P
         mode: parse_mode(&row.get::<_, String>("mode"))?,
         audience: row.get("audience"),
         request_hmac_key,
+        request_protocol: parse_protocol(&row.get::<_, String>("request_protocol"))?,
         public_jwk,
         status: parse_status(&row.get::<_, String>("status"))?,
         created_at_ms: from_i64(row.get("created_at_ms"))?,
@@ -975,7 +1071,9 @@ fn same_authorization_policy(left: &PairRecord, right: &PairRecord) -> bool {
         && left.status == right.status
         && left.scope == right.scope
         && left.mode == right.mode
+        && left.audience == right.audience
         && left.request_hmac_key == right.request_hmac_key
+        && left.request_protocol == right.request_protocol
         && left.public_jwk == right.public_jwk
         && left.expires_at_ms == right.expires_at_ms
         && left.max_requests == right.max_requests
@@ -984,16 +1082,16 @@ fn same_authorization_policy(left: &PairRecord, right: &PairRecord) -> bool {
 }
 
 fn hash_token(token: &str) -> String {
-    Sha256::digest(token.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 fn pair_secret_context(pair_id: &str) -> String {
     format!("bpc-postgres-pair-hmac-v1:{pair_id}")
 }
-fn pending_secret_context(token_hash: &str) -> String {
-    format!("bpc-postgres-pending-registration-v1:{token_hash}")
+fn pending_metadata_context(token_hash: &str) -> String {
+    format!("bpc-postgres-pending-metadata-v2:{token_hash}")
+}
+fn pending_hmac_context(token_hash: &str) -> String {
+    format!("bpc-postgres-pending-hmac-v2:{token_hash}")
 }
 fn is_key_id(value: &str) -> bool {
     !value.is_empty()
@@ -1119,6 +1217,15 @@ fn parse_mode(value: &str) -> Result<PairMode> {
         _ => Err(BpcError::PairRegistry("invalid stored mode".into())),
     }
 }
+fn parse_protocol(value: &str) -> Result<PairRequestProtocol> {
+    match value {
+        "v1-compatibility" => Ok(PairRequestProtocol::V1Compatibility),
+        "v2" => Ok(PairRequestProtocol::V2),
+        _ => Err(BpcError::PairRegistry(
+            "invalid stored request protocol".into(),
+        )),
+    }
+}
 fn parse_status(value: &str) -> Result<PairStatus> {
     match value {
         "active" => Ok(PairStatus::Active),
@@ -1180,6 +1287,12 @@ fn mode_text(value: PairMode) -> &'static str {
     match value {
         PairMode::Development => "development",
         PairMode::Production => "production",
+    }
+}
+fn protocol_text(value: PairRequestProtocol) -> &'static str {
+    match value {
+        PairRequestProtocol::V1Compatibility => "v1-compatibility",
+        PairRequestProtocol::V2 => "v2",
     }
 }
 fn status_text(value: PairStatus) -> &'static str {
@@ -1268,6 +1381,19 @@ mod tests {
                 "postgres://user:pass@db.example.test/db?sslmode=require"
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod hash_vectors {
+    use super::hash_token;
+
+    #[test]
+    fn approval_token_hash_fixed_vector_is_stable() {
+        assert_eq!(
+            hash_token("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 }

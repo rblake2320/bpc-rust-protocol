@@ -1,0 +1,35 @@
+{
+  "generated_by": "Node.js WebCrypto ECDSA P-256 + HKDF-SHA256 BPC v2",
+  "registration_secret": "InteropSecret9!@",
+  "request_hmac_key": "ej9BnVtEynT7V4GNQMXm-cFBazbwM_Dwluj3DaHLxig",
+  "public_jwk": {
+    "kty": "EC",
+    "crv": "P-256",
+    "x": "bJyPHE6sIVzETYbznxG2ER7aC-eN4Dviwmf8xFIL1Tk",
+    "y": "AudfT34_fI2CGRxiv-ypRxnR3znBGubHd-3_sSoGFP4",
+    "key_ops": [
+      "verify"
+    ],
+    "ext": true
+  },
+  "body_base64url": "eyJ3aWRnZXQiOiJicGMiLCJjb3VudCI6Mn0",
+  "payload": {
+    "audience": "bpc://api.example.test/production",
+    "body_hash": "sha256:oylRM3B035IWXcW-sL7flyhrHVBqdv7Y23wulC03kes",
+    "method": "POST",
+    "mode": "production",
+    "nonce": "123e4567-e89b-42d3-a456-426614174000",
+    "pair_id": "pair_nodeinterop",
+    "path": "/v1/widgets?source=node",
+    "purpose": "http-request",
+    "timestamp": 1740000000000,
+    "version": "2.0"
+  },
+  "headers": {
+    "hmac": "B-A6E77pGCsZOLBhfkTmEMeQAGDkv9wP8tFi91TL_7g",
+    "pair_id": "pair_nodeinterop",
+    "signature": "IibWq0t35A90dKMLTKC-yStDwVYhV1gP1v-H_j7aGuCvkEffGAdThLjGhjP5IJ5GiVVV4NpIZ-DYTzraDFG2HQ",
+    "signed_data": "eyJhdWRpZW5jZSI6ImJwYzovL2FwaS5leGFtcGxlLnRlc3QvcHJvZHVjdGlvbiIsImJvZHlfaGFzaCI6InNoYTI1NjpveWxSTTNCMDM1SVdYY1ctc0w3Zmx5aHJIVkJxZHY3WTIzd3VsQzAza2VzIiwibWV0aG9kIjoiUE9TVCIsIm1vZGUiOiJwcm9kdWN0aW9uIiwibm9uY2UiOiIxMjNlNDU2Ny1lODliLTQyZDMtYTQ1Ni00MjY2MTQxNzQwMDAiLCJwYWlyX2lkIjoicGFpcl9ub2RlaW50ZXJvcCIsInBhdGgiOiIvdjEvd2lkZ2V0cz9zb3VyY2U9bm9kZSIsInB1cnBvc2UiOiJodHRwLXJlcXVlc3QiLCJ0aW1lc3RhbXAiOjE3NDAwMDAwMDAwMDAsInZlcnNpb24iOiIyLjAifQ",
+    "version": "2.0"
+  }
+}

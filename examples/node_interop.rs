@@ -1,4 +1,4 @@
-use bpc_protocol::{BpcKeyPair, sign_request_at};
+use bpc_protocol::{BpcKeyPair, BpcSigningContext, PairMode, sign_request_at};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         keypair.signing_key(),
         "pair_rustinterop",
         secret,
+        &BpcSigningContext::new("bpc://api.example.test/production", PairMode::Production)?,
         "PUT",
         "/v1/interop?peer=node",
         body,

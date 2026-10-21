@@ -243,10 +243,7 @@ pub fn audit_hash(entry: &AuditEntry) -> Result<String> {
         entry.event.request_id.as_deref(),
         entry.event.detail.as_deref(),
     ))?;
-    Ok(Sha256::digest(preimage)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(format!("{:x}", Sha256::digest(preimage)))
 }
 
 /// Verifies chain order, the genesis invariant, every hash/link, and an optional external anchor.
@@ -354,4 +351,35 @@ pub fn verify_audit_entries(
         broken_at_sequence: None,
         reason: None,
     })
+}
+
+#[cfg(test)]
+mod hash_vectors {
+    use super::{AuditAction, AuditEntry, AuditEvent, AuditSeverity, GENESIS_HASH, audit_hash};
+
+    #[test]
+    fn audit_hash_fixed_vector_is_stable() {
+        let entry = AuditEntry {
+            id: "audit_fixed".into(),
+            timestamp_ms: 1_740_000_000_000,
+            sequence: 1,
+            previous_hash: GENESIS_HASH.into(),
+            chain_hash: String::new(),
+            event: AuditEvent {
+                action: AuditAction::VerifyPass,
+                severity: AuditSeverity::Info,
+                pair_id: Some("pair_protocol".into()),
+                error_code: None,
+                source_ip: None,
+                method: Some("POST".into()),
+                path: Some("/v1/widgets".into()),
+                request_id: Some("request-fixed".into()),
+                detail: Some("fixed test vector".into()),
+            },
+        };
+        assert_eq!(
+            audit_hash(&entry).unwrap(),
+            "75e9c2b621ab7709834235abcefbe7971c2e00071b8ce99ad72d915466b6cd25"
+        );
+    }
 }

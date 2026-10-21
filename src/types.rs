@@ -6,16 +6,58 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::crypto::compute_fingerprint;
 use crate::{BpcError, Result};
 
-/// The BPC request protocol version implemented by this crate.
-pub const BPC_PROTOCOL_VERSION: &str = "1.0";
+/// Legacy BPC wire version retained only for an explicit migration build.
+pub const BPC_V1_PROTOCOL_VERSION: &str = "1.0";
+/// Secure-default BPC request wire version.
+pub const BPC_V2_PROTOCOL_VERSION: &str = "2.0";
+/// The secure-default BPC request protocol version implemented by this crate.
+pub const BPC_PROTOCOL_VERSION: &str = BPC_V2_PROTOCOL_VERSION;
 /// Largest integer that remains exactly representable in JavaScript and JSON.
 pub const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 /// Maximum length of a locally configured BPC audience identifier.
 pub const MAX_AUDIENCE_LEN: usize = 256;
+
+/// The protocol selected when a pair is enrolled. A pair accepts one protocol,
+/// never an unauthenticated fallback between versions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PairRequestProtocol {
+    /// Existing v1 credentials; compatibility-only and never the default.
+    V1Compatibility,
+    /// Request-bound BPC v2 credentials.
+    V2,
+}
+
+/// Derived 32-byte request-HMAC verifier material.
+///
+/// This is a credential factor, not a password hash. It has no public string,
+/// display, or Serde surface; only persistence adapters inside this crate can
+/// access its canonical base64url representation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretRequestHmacKey(Zeroizing<String>);
+
+impl SecretRequestHmacKey {
+    pub fn from_base64url(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_request_hmac_key(&value)?;
+        Ok(Self(Zeroizing::new(value)))
+    }
+
+    pub(crate) fn encoded(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretRequestHmacKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretRequestHmacKey([REDACTED])")
+    }
+}
 
 /// A public ECDSA P-256 JWK accepted by BPC v1.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,18 +205,20 @@ impl BpcKeyPair {
     }
 }
 
-/// Exactly the canonical BPC v1 signed request payload.
+/// Exactly the canonical BPC v2 signed request core.
 ///
 /// Field declaration order is alphabetical and is the canonical JSON order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BpcPayload {
+    pub audience: String,
     pub body_hash: String,
     pub method: String,
+    pub mode: PairMode,
     pub nonce: String,
     pub pair_id: String,
     pub path: String,
-    pub secret_hmac: String,
+    pub purpose: String,
     pub timestamp: u64,
     pub version: String,
 }
@@ -183,6 +227,8 @@ pub struct BpcPayload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedHeaders {
+    /// Base64url BPC v2 request HMAC over the canonical core.
+    pub hmac: String,
     pub pair_id: String,
     pub signature: String,
     pub signed_data: String,
@@ -190,9 +236,10 @@ pub struct SignedHeaders {
 }
 
 impl SignedHeaders {
-    /// Returns the four HTTP header/value pairs required by BPC v1.
-    pub fn as_http_headers(&self) -> [(&'static str, &str); 4] {
+    /// Returns the five HTTP header/value pairs required by BPC v2.
+    pub fn as_http_headers(&self) -> [(&'static str, &str); 5] {
         [
+            ("X-BPC-HMAC", &self.hmac),
             ("X-BPC-Pair-ID", &self.pair_id),
             ("X-BPC-Signature", &self.signature),
             ("X-BPC-Signed-Data", &self.signed_data),
@@ -264,18 +311,19 @@ pub enum CanaryClass {
 }
 
 /// Pair metadata required by the portable BPC verifier.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PairRecord {
     pub id: String,
     pub name: String,
     pub scope: Scope,
     pub mode: PairMode,
     /// Locally configured trust domain, for example
-    /// `bpc://api.example.test/tenant-a/production`. It is an authority-record
-    /// binding for BPC v1; v2 additionally signs and MACs it on the wire.
+    /// `bpc://api.example.test/tenant-a/production`.
     pub audience: String,
-    /// Base64url HKDF-derived request HMAC key. It is verifier material, not a password hash.
-    pub request_hmac_key: String,
+    /// HKDF-derived verifier material. It cannot be serialized or printed.
+    pub request_hmac_key: SecretRequestHmacKey,
+    /// Exactly one protocol policy is accepted for a pair.
+    pub request_protocol: PairRequestProtocol,
     pub public_jwk: PublicJwk,
     pub status: PairStatus,
     pub created_at_ms: u64,
@@ -291,8 +339,33 @@ pub struct PairRecord {
     pub canary_class: Option<CanaryClass>,
     /// Successor created by a rotation. This lineage is traversed for a
     /// credential-family revocation.
-    #[serde(default)]
     pub replaced_by: Option<String>,
+}
+
+impl std::fmt::Debug for PairRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairRecord")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("scope", &self.scope)
+            .field("mode", &self.mode)
+            .field("audience", &self.audience)
+            .field("request_hmac_key", &"[REDACTED]")
+            .field("request_protocol", &self.request_protocol)
+            .field("public_jwk", &self.public_jwk)
+            .field("status", &self.status)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("max_requests", &self.max_requests)
+            .field("requests", &self.requests)
+            .field("failed_signatures", &self.failed_signatures)
+            .field("authorization_version", &self.authorization_version)
+            .field("kind", &self.kind)
+            .field("canary_class", &self.canary_class)
+            .field("replaced_by", &self.replaced_by)
+            .finish()
+    }
 }
 
 impl PairRecord {
@@ -317,7 +390,6 @@ impl PairRecord {
             ));
         }
         self.public_jwk.to_verifying_key()?;
-        validate_request_hmac_key(&self.request_hmac_key)?;
         if matches!(self.kind, PairKind::Ghost) != self.canary_class.is_some() {
             return Err(BpcError::PairRegistry(
                 "ghost pairs require a canary class and legitimate pairs cannot have one".into(),
@@ -330,6 +402,7 @@ impl PairRecord {
 /// Verification-time request data. The body must be the exact bytes sent on the wire.
 #[derive(Clone, Copy, Debug)]
 pub struct BpcRequest<'a> {
+    pub hmac: &'a str,
     pub pair_id: &'a str,
     pub signature: &'a str,
     pub signed_data: &'a str,
@@ -345,6 +418,9 @@ pub struct AuthSnapshot {
     pub pair_id: String,
     pub scope: Scope,
     pub mode: PairMode,
+    /// Cryptographically authenticated v2 audience, retained for handlers.
+    pub audience: String,
+    pub request_protocol: PairRequestProtocol,
     pub kind: PairKind,
     pub canary_class: Option<CanaryClass>,
     pub verified_at_ms: u64,
@@ -374,6 +450,9 @@ pub enum VerificationError {
     InvalidSignature,
     ReplayDetected,
     ReplayStoreUnavailable,
+    /// The nonce was consumed but the durable final authorization claim failed.
+    /// Do not retry these signed headers; obtain state and sign a new request.
+    PairFinalizationUnavailable,
     PairStateChanged,
     GhostPairDenied,
 }
@@ -402,7 +481,10 @@ impl VerificationError {
             Self::InvalidSignature => "invalid_signature",
             Self::ReplayDetected => "replay_detected",
             Self::ReplayStoreUnavailable => "replay_store_unavailable",
-            Self::PairStateChanged => "pair_state_changed_retry",
+            Self::PairFinalizationUnavailable => "pair_finalization_unavailable",
+            // The nonce was spent before the final authorization claim. Retrying
+            // the same signed request can only be a replay.
+            Self::PairStateChanged => "pair_state_changed",
             Self::GhostPairDenied => "ghost_pair_denied",
         }
     }
@@ -696,7 +778,9 @@ impl PairRegistry for MemoryPairRegistry {
             || pair.status != expected.status
             || pair.scope != expected.scope
             || pair.mode != expected.mode
+            || pair.audience != expected.audience
             || pair.request_hmac_key != expected.request_hmac_key
+            || pair.request_protocol != expected.request_protocol
             || pair.public_jwk != expected.public_jwk
             || pair.expires_at_ms != expected.expires_at_ms
             || pair.max_requests != expected.max_requests
