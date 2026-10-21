@@ -32,6 +32,7 @@ For a high-assurance deployment, the HMAC factor must originate from `generate_h
 | `reqwest-client` | HTTPS-capable client transport that signs exact transmitted body bytes |
 | `production` | All runtime integrations |
 | `live-integration` | Real Redis/PostgreSQL test gate; enables both test-only plaintext features and requires `BPC_TEST_REDIS_URL` and `BPC_TEST_POSTGRES_URL` |
+| `control-service` | Feature-gated `bpc-lifecycle-control` HTTPS TLS-1.3 mTLS lifecycle service backed exclusively by `PostgresPairAuthority` |
 
 ## Install
 
@@ -182,6 +183,84 @@ let app = Router::new().layer(middleware::from_fn_with_state(state, bpc_axum_mid
 5. `verify_and_rotate_at` validates the old signature and atomically retires the old pair before activating the successor.
 
 An authorization version fence means a request cryptographically checked before a concurrent revoke/rotation/policy mutation cannot complete the final claim as though the old policy still applied.
+
+### TLS-1.3 mTLS lifecycle control service
+
+`bpc-lifecycle-control` is a standalone control-plane binary for Keyforge and
+other trusted provisioning systems. It is **not** a TSK/bridge component and it
+does not link to or require one. At runtime it constructs only a durable
+`PostgresPairAuthority` using its TLS-only constructor; it neither exposes nor
+uses the test-only plaintext PostgreSQL constructors.
+
+The service accepts exactly one **absolute** config-file path. The final file
+must be regular, non-symlinked, have exactly one hard link, and have mode
+`0600`; startup errors are category-only and never print a DSN, token, path,
+certificate, raw JWK, or secret. It never runs database migrations using the
+runtime listener. Run its explicit migration-only mode separately with a
+dedicated migration role before starting the normal listener.
+
+```toml
+# /etc/bpc/lifecycle-control.toml (chmod 0600; no symlink or hard link)
+bind_addr = "127.0.0.1:8443"
+# Required only when intentionally exposing the mutually authenticated listener
+# through a controlled ingress instead of loopback.
+allow_non_loopback_bind = false
+bearer_token = "replace_with_a_32_character_or_longer_random_control_token"
+database_url = "postgres://bpc_control@db.example.internal/bpc?sslmode=require"
+postgres_ca_pem_path = "/etc/bpc/postgres-ca.pem"
+
+[tls]
+certificate_chain_pem_path = "/etc/bpc/server-chain.pem"
+private_key_pem_path = "/etc/bpc/server-key.pem"
+client_ca_pem_path = "/etc/bpc/control-client-ca.pem"
+
+[authority]
+max_active_pairs = 2000
+approval_ttl_ms = 900000
+schema = "public"
+```
+
+Build and run the binary with its isolated feature flag:
+
+```bash
+cargo run --locked --features control-service --bin bpc-lifecycle-control -- \
+  /etc/bpc/lifecycle-control.toml
+```
+
+Run the idempotent authority migration as a separately privileged operation:
+
+```bash
+cargo run --locked --features control-service --bin bpc-lifecycle-control -- \
+  /etc/bpc/lifecycle-control.toml --migrate
+```
+
+The listener uses Rustls with **TLS 1.3 only**, requires a client certificate
+anchored by `client_ca_pem_path`, and terminates a failed client handshake before
+HTTP routing. Every routed request must additionally have exactly one
+`Authorization: Bearer <token>` header. The configured token is hashed in memory
+and requests are checked against that hash in constant time. The PostgreSQL
+connector requires TLS 1.3, trusts only the configured private CA for this
+privileged service, retains native-TLS certificate and hostname verification,
+and rejects any plaintext fallback.
+
+| Method/path | Request schema | Successful response | Reconciliation behavior |
+| --- | --- | --- | --- |
+| `POST /v1/control/bpc/provision` | `pairId`, `publicJwk`, `requestHmacKey`, optional bounded public `bundleId` | `{ "pairId": "…", "outcome": "created\|existing" }` | Atomically creates the requested BPC pair ID or reports `existing` only when every authorization-relevant field is identical. A changed/inactive ID gives `409 lifecycle_conflict`; choose a fresh pair ID or use signed rotation. |
+| `POST /v1/control/bpc/revoke` | `pairId` | `{ "pairId": "…", "status": "revoked" }` | Repeating a completed revoke remains `200`; an ID that never existed returns `404 pair_not_found`. |
+| `POST /v1/control/bpc/rotate` | Public [`RotationRequest`](#pair-lifecycle-and-rotation) fields | `{ "pairId": "new-id" }` | Uses `verify_and_rotate_at`, so Keyforge signs locally with its old key and the service receives only a signature/public material, never a private key. |
+
+The provisioning JSON has `deny_unknown_fields`; it does **not** accept
+`privateSigningKey`, `registrationSecret`, or any arbitrary metadata. The
+optional Keyforge `bundleId` is limited to a short lowercase URL-safe identifier
+and discarded before authority calls, persistence, logging, or responses. The
+`requestHmacKey` must already be the 32-byte base64url derived verifier value.
+Private signing keys and registration secrets must stay in the client-side
+KMS/HSM/secret manager and are never sent to this service.
+
+All failures have the stable envelope
+`{ "error": { "code": "…" } }`: `unauthorized`, `malformed_request`,
+`pair_not_found`, `lifecycle_conflict`, or `authority_unavailable`. Internal
+PostgreSQL/TLS/parser text is intentionally neither logged nor returned.
 
 ## Canary pairs
 

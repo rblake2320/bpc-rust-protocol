@@ -85,6 +85,19 @@ pub struct RedactedPair {
     pub requests: u64,
 }
 
+/// Result of an authenticated control-plane provisioning reconciliation.
+///
+/// `Created` means a new active pair was durably approved. `Existing` means
+/// the requested pair ID was already active with exactly the same
+/// authorization-relevant registration. Both outcomes are successful and let
+/// callers safely retry after a timeout or restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvisionPairOutcome {
+    Created,
+    Existing,
+}
+
 /// Atomic lifecycle interface required by registration approval and signed rotation.
 ///
 /// Implementations must make approval and rotation a single authoritative state
@@ -93,6 +106,18 @@ pub struct RedactedPair {
 pub trait PairAuthority: PairRegistry {
     fn request_pairing(&self, registration: PairRegistration, now_ms: u64) -> Result<String>;
     fn approve_pairing(&self, token: &str, now_ms: u64) -> Result<String>;
+    /// Atomically creates and approves a pair with a caller-selected ID, or
+    /// confirms an identical active pair already exists at that ID.
+    ///
+    /// This is for an already authenticated control plane, not an untrusted
+    /// registration endpoint. Implementations must reject material changes or
+    /// a non-active existing pair rather than silently replacing a credential.
+    fn provision_pair(
+        &self,
+        pair_id: &str,
+        registration: PairRegistration,
+        now_ms: u64,
+    ) -> Result<ProvisionPairOutcome>;
     fn revoke(&self, pair_id: &str) -> Result<bool>;
     fn rotate_pair(&self, expected_old: &PairRecord, replacement: PairRecord) -> Result<bool>;
     fn list_redacted(&self) -> Result<Vec<RedactedPair>>;
@@ -212,6 +237,49 @@ impl PairAuthority for MemoryPairAuthority {
         Ok(id)
     }
 
+    fn provision_pair(
+        &self,
+        pair_id: &str,
+        registration: PairRegistration,
+        now_ms: u64,
+    ) -> Result<ProvisionPairOutcome> {
+        registration.validate()?;
+        if !is_valid_pair_id(pair_id) || now_ms > MAX_JS_SAFE_INTEGER {
+            return Err(BpcError::PairRegistry(
+                "provisioning pair ID or timestamp is invalid".into(),
+            ));
+        }
+        let pair = PairRecord {
+            id: pair_id.to_owned(),
+            name: registration.name,
+            scope: registration.scope,
+            mode: registration.mode,
+            request_hmac_key: registration.request_hmac_key,
+            public_jwk: registration.public_jwk,
+            status: PairStatus::Active,
+            created_at_ms: now_ms,
+            expires_at_ms: registration.expires_at_ms,
+            max_requests: registration.max_requests,
+            requests: 0,
+            failed_signatures: 0,
+            authorization_version: 1,
+            kind: registration.kind,
+            canary_class: registration.canary_class,
+        };
+        if let Some(existing) = self
+            .registry
+            .insert_if_absent_with_capacity(pair.clone(), self.max_active_pairs)?
+        {
+            if existing.status == PairStatus::Active && pair_matches_pair(&existing, &pair) {
+                return Ok(ProvisionPairOutcome::Existing);
+            }
+            return Err(BpcError::PairRegistry(
+                "requested pair ID belongs to a different or inactive registration".into(),
+            ));
+        }
+        Ok(ProvisionPairOutcome::Created)
+    }
+
     fn revoke(&self, pair_id: &str) -> Result<bool> {
         if self.registry.get(pair_id)?.is_none() {
             return Ok(false);
@@ -240,6 +308,33 @@ impl PairAuthority for MemoryPairAuthority {
             })
             .collect::<Vec<_>>())
     }
+}
+
+pub(crate) fn pair_matches_registration(
+    pair: &PairRecord,
+    registration: &PairRegistration,
+) -> bool {
+    pair.name == registration.name
+        && pair.scope == registration.scope
+        && pair.mode == registration.mode
+        && pair.request_hmac_key == registration.request_hmac_key
+        && pair.public_jwk == registration.public_jwk
+        && pair.expires_at_ms == registration.expires_at_ms
+        && pair.max_requests == registration.max_requests
+        && pair.kind == registration.kind
+        && pair.canary_class == registration.canary_class
+}
+
+fn pair_matches_pair(left: &PairRecord, right: &PairRecord) -> bool {
+    left.name == right.name
+        && left.scope == right.scope
+        && left.mode == right.mode
+        && left.request_hmac_key == right.request_hmac_key
+        && left.public_jwk == right.public_jwk
+        && left.expires_at_ms == right.expires_at_ms
+        && left.max_requests == right.max_requests
+        && left.kind == right.kind
+        && left.canary_class == right.canary_class
 }
 
 /// The signed contents of a BPC key-rotation request.
@@ -293,7 +388,7 @@ pub fn sign_rotation_at(
 }
 
 /// Verifies a signed rotation and atomically switches the authority to its successor.
-pub fn verify_and_rotate_at<A: PairAuthority>(
+pub fn verify_and_rotate_at<A: PairAuthority + ?Sized>(
     authority: &A,
     request: &RotationRequest,
     now_ms: u64,

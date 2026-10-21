@@ -20,10 +20,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::authority::pair_matches_registration;
 use crate::{
     AuditAction, AuditEntry, AuditEvent, AuditHead, AuditLog, AuditSeverity, AuditVerification,
     BpcError, CanaryClass, PairAuthority, PairKind, PairMode, PairRecord, PairRegistration,
-    PairRegistry, PairStatus, PublicJwk, RedactedPair, Result, Scope, SuccessClaim,
+    PairRegistry, PairStatus, ProvisionPairOutcome, PublicJwk, RedactedPair, Result, Scope,
+    SuccessClaim, is_valid_pair_id,
 };
 
 /// Fresh-install schema for the Rust production authority. It uses strict
@@ -94,18 +96,38 @@ CREATE INDEX IF NOT EXISTS bpc_audit_time_idx ON bpc_audit (timestamp_ms DESC);
 
 /// TLS trust configuration for the PostgreSQL production constructors.
 ///
-/// The connector always uses the platform trust store and native TLS's default
-/// certificate and hostname verification. Add the private CA certificate used
-/// by a managed or internal PostgreSQL deployment to
+/// The connector uses the platform trust store by default and always retains
+/// native TLS certificate and hostname verification. A privileged deployment
+/// can require an exclusive private CA by disabling platform roots before
+/// adding the private CA certificate used by its database deployment to
 /// [`additional_root_certificates_pem`](Self::additional_root_certificates_pem).
 /// Each vector must contain one PEM-encoded X.509 CA certificate.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct PostgresTlsConfig {
+    /// Whether operating-system trust roots are accepted in addition to explicit
+    /// private roots. Defaults to `true` for library compatibility.
+    pub use_system_roots: bool,
     /// Private CA certificates in PEM format, in addition to platform roots.
     pub additional_root_certificates_pem: Vec<Vec<u8>>,
 }
 
+impl Default for PostgresTlsConfig {
+    fn default() -> Self {
+        Self {
+            use_system_roots: true,
+            additional_root_certificates_pem: Vec::new(),
+        }
+    }
+}
+
 impl PostgresTlsConfig {
+    /// Select whether operating-system trust roots are accepted. Disabling
+    /// them requires at least one valid private CA root before connection.
+    pub fn with_system_roots(mut self, enabled: bool) -> Self {
+        self.use_system_roots = enabled;
+        self
+    }
+
     /// Adds one PEM-encoded private CA certificate to the trusted roots.
     pub fn with_additional_root_certificate_pem(mut self, certificate: impl Into<Vec<u8>>) -> Self {
         self.additional_root_certificates_pem
@@ -114,10 +136,18 @@ impl PostgresTlsConfig {
     }
 
     fn build_connector(&self) -> Result<MakeTlsConnector> {
+        if !self.use_system_roots && self.additional_root_certificates_pem.is_empty() {
+            return Err(BpcError::PairRegistry(
+                "exclusive PostgreSQL TLS trust requires a private root certificate".into(),
+            ));
+        }
         let mut builder = TlsConnector::builder();
-        // Keep the secure protocol floor explicit rather than inheriting a
-        // dependency default that could change in a future release.
-        builder.min_protocol_version(Some(Protocol::Tlsv12));
+        // Keep the TLS 1.3 floor explicit rather than inheriting a dependency
+        // default that could change in a future release.
+        builder.min_protocol_version(Some(Protocol::Tlsv13));
+        builder.danger_accept_invalid_certs(false);
+        builder.danger_accept_invalid_hostnames(false);
+        builder.disable_built_in_roots(!self.use_system_roots);
         for certificate in &self.additional_root_certificates_pem {
             let certificate = Certificate::from_pem(certificate).map_err(|error| {
                 BpcError::PairRegistry(format!("invalid PostgreSQL TLS root certificate: {error}"))
@@ -209,6 +239,7 @@ impl PostgresPairAuthority {
     /// restrict this method from the runtime application's database credential.
     pub fn migrate(&self) -> Result<()> {
         let mut client = self.lock_client()?;
+        ensure_schema(&mut client, &self.config.schema)?;
         client.batch_execute(POSTGRES_SCHEMA).map_err(pg_error)
     }
 
@@ -426,6 +457,78 @@ impl PairAuthority for PostgresPairAuthority {
         Ok(id)
     }
 
+    fn provision_pair(
+        &self,
+        pair_id: &str,
+        registration: PairRegistration,
+        now_ms: u64,
+    ) -> Result<ProvisionPairOutcome> {
+        registration.validate()?;
+        if !is_valid_pair_id(pair_id) || now_ms > crate::MAX_JS_SAFE_INTEGER {
+            return Err(BpcError::PairRegistry(
+                "provisioning pair ID or timestamp is invalid".into(),
+            ));
+        }
+        let mut client = self.lock_client()?;
+        let mut tx = self.begin(&mut client)?;
+        // Serialize the same external pair ID before inspecting or inserting it.
+        // A hash collision merely serializes unrelated provisioning requests.
+        tx.query_one("SELECT pg_advisory_xact_lock(hashtext($1))", &[&pair_id])
+            .map_err(pg_error)?;
+        if let Some(row) = tx
+            .query_opt(
+                "SELECT * FROM bpc_pairs WHERE id=$1 FOR UPDATE",
+                &[&pair_id],
+            )
+            .map_err(pg_error)?
+        {
+            let existing = row_to_pair(row)?;
+            tx.commit().map_err(pg_error)?;
+            if existing.status == PairStatus::Active
+                && pair_matches_registration(&existing, &registration)
+            {
+                return Ok(ProvisionPairOutcome::Existing);
+            }
+            return Err(BpcError::PairRegistry(
+                "requested pair ID belongs to a different or inactive registration".into(),
+            ));
+        }
+        tx.query_one("SELECT pg_advisory_xact_lock(842321904)", &[])
+            .map_err(pg_error)?;
+        let active: i64 = tx
+            .query_one("SELECT count(*) FROM bpc_pairs WHERE status='active'", &[])
+            .map_err(pg_error)?
+            .get(0);
+        if u64::try_from(active)
+            .map_err(|_| BpcError::PairRegistry("active pair count invalid".into()))?
+            >= self.config.max_active_pairs
+        {
+            return Err(BpcError::PairRegistry(
+                "maximum active pair capacity reached".into(),
+            ));
+        }
+        let pair = PairRecord {
+            id: pair_id.to_owned(),
+            name: registration.name,
+            scope: registration.scope,
+            mode: registration.mode,
+            request_hmac_key: registration.request_hmac_key,
+            public_jwk: registration.public_jwk,
+            status: PairStatus::Active,
+            created_at_ms: now_ms,
+            expires_at_ms: registration.expires_at_ms,
+            max_requests: registration.max_requests,
+            requests: 0,
+            failed_signatures: 0,
+            authorization_version: 1,
+            kind: registration.kind,
+            canary_class: registration.canary_class,
+        };
+        insert_pair(&mut tx, &pair)?;
+        tx.commit().map_err(pg_error)?;
+        Ok(ProvisionPairOutcome::Created)
+    }
+
     fn revoke(&self, pair_id: &str) -> Result<bool> {
         let mut client = self.lock_client()?;
         let changed = client.execute(
@@ -509,6 +612,7 @@ impl PairAuthority for PostgresPairAuthority {
 /// singleton head row so concurrent appenders receive deterministic sequences.
 pub struct PostgresAuditLog {
     client: Mutex<Client>,
+    schema: String,
 }
 
 impl PostgresAuditLog {
@@ -549,6 +653,7 @@ impl PostgresAuditLog {
         set_schema(&mut client, &schema)?;
         Ok(Self {
             client: Mutex::new(client),
+            schema,
         })
     }
 
@@ -557,6 +662,7 @@ impl PostgresAuditLog {
             .client
             .lock()
             .map_err(|_| BpcError::PairRegistry("PostgreSQL audit client lock poisoned".into()))?;
+        ensure_schema(&mut client, &self.schema)?;
         client.batch_execute(POSTGRES_SCHEMA).map_err(pg_error)
     }
 }
@@ -881,6 +987,7 @@ fn canary_text(value: CanaryClass) -> &'static str {
 fn is_schema_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
+        && !value.starts_with("pg_")
         && value.bytes().enumerate().all(|(i, b)| {
             (i == 0 && (b.is_ascii_alphabetic() || b == b'_'))
                 || (i > 0 && (b.is_ascii_alphanumeric() || b == b'_'))
@@ -888,8 +995,27 @@ fn is_schema_name(value: &str) -> bool {
 }
 fn set_schema(client: &mut Client, schema: &str) -> Result<()> {
     client
-        .batch_execute(&format!("SET search_path TO {schema}, pg_catalog"))
+        .batch_execute(&format!(
+            "SET search_path TO {}, pg_catalog",
+            quote_schema(schema)
+        ))
         .map_err(pg_error)
+}
+
+fn ensure_schema(client: &mut Client, schema: &str) -> Result<()> {
+    client
+        .batch_execute(&format!(
+            "CREATE SCHEMA IF NOT EXISTS {}",
+            quote_schema(schema)
+        ))
+        .map_err(pg_error)?;
+    set_schema(client, schema)
+}
+
+fn quote_schema(schema: &str) -> String {
+    // All callers validate with `is_schema_name`; the explicit double-quoting
+    // preserves the configured case-free identifier as one SQL identifier.
+    format!("\"{schema}\"")
 }
 
 #[cfg(test)]
@@ -913,6 +1039,14 @@ mod tests {
             .expect("a TCP hostname is usable once TLS is made mandatory");
         assert_eq!(config.get_ssl_mode(), SslMode::Require);
 
+        match PostgresTlsConfig::default()
+            .with_system_roots(false)
+            .build_connector()
+        {
+            Ok(_) => panic!("an exclusive trust policy needs a configured private root"),
+            Err(error) => assert!(error.to_string().contains("exclusive PostgreSQL TLS trust")),
+        }
+
         let result = PostgresTlsConfig::default()
             .with_additional_root_certificate_pem(b"not a PEM certificate".to_vec())
             .build_connector();
@@ -935,5 +1069,11 @@ mod tests {
             ..PostgresAuthorityConfig::default()
         };
         assert!(invalid_schema.validate().is_err());
+
+        let reserved_schema = PostgresAuthorityConfig {
+            schema: "pg_catalog".into(),
+            ..PostgresAuthorityConfig::default()
+        };
+        assert!(reserved_schema.validate().is_err());
     }
 }

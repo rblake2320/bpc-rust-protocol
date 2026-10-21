@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! # bpc-protocol
 //!
 //! A Rust implementation of BPC (Bound Pair Credentials) v1 HTTP request
@@ -51,6 +53,8 @@ mod authority;
 mod axum;
 mod canonical;
 mod client;
+#[cfg(feature = "control-service")]
+pub mod control_service;
 mod crypto;
 mod error;
 #[cfg(feature = "postgres-store")]
@@ -69,8 +73,8 @@ pub use audit::{
     GENESIS_HASH, MemoryAuditLog, audit_hash, verify_audit_entries,
 };
 pub use authority::{
-    MemoryPairAuthority, PairAuthority, PairRegistration, PendingPairing, RedactedPair,
-    RotationPayload, RotationRequest, sign_rotation_at, verify_and_rotate_at,
+    MemoryPairAuthority, PairAuthority, PairRegistration, PendingPairing, ProvisionPairOutcome,
+    RedactedPair, RotationPayload, RotationRequest, sign_rotation_at, verify_and_rotate_at,
 };
 pub use canonical::{
     canonical_payload, canonical_payload_bytes, parse_canonical_payload, validate_payload_shape,

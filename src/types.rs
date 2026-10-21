@@ -468,6 +468,36 @@ impl MemoryPairRegistry {
         Ok(())
     }
 
+    /// Atomically inserts a new active pair subject to a capacity limit, or
+    /// returns the current record at that ID. This is crate-private lifecycle
+    /// plumbing for [`crate::MemoryPairAuthority`]; callers must apply their
+    /// own authorization-relevant equality policy to an existing record.
+    pub(crate) fn insert_if_absent_with_capacity(
+        &self,
+        pair: PairRecord,
+        max_active_pairs: usize,
+    ) -> Result<Option<PairRecord>> {
+        pair.validate()?;
+        let mut pairs = self
+            .pairs
+            .lock()
+            .map_err(|_| BpcError::PairRegistry("memory registry lock poisoned".into()))?;
+        if let Some(existing) = pairs.get(&pair.id) {
+            return Ok(Some(existing.clone()));
+        }
+        let active = pairs
+            .values()
+            .filter(|stored| stored.status == PairStatus::Active)
+            .count();
+        if active >= max_active_pairs {
+            return Err(BpcError::PairRegistry(format!(
+                "maximum pair capacity ({max_active_pairs}) reached"
+            )));
+        }
+        pairs.insert(pair.id.clone(), pair);
+        Ok(None)
+    }
+
     pub fn update_status(&self, pair_id: &str, status: PairStatus) -> Result<()> {
         let mut pairs = self
             .pairs
